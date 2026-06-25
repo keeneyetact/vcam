@@ -56,6 +56,11 @@ except ImportError:  # pragma: no cover
     pyvirtualcam = None
     PixelFormat = None
 
+try:
+    import onnxruntime as ort
+except ImportError:  # pragma: no cover
+    ort = None
+
 
 HERE = Path(__file__).resolve().parent
 MODEL_DIR = HERE / "models"
@@ -74,24 +79,40 @@ MODELS = {
     },
 }
 
+# RobustVideoMatting — real-time video matting with temporal coherence. Far
+# better edges/hair/hands than the lightweight selfie segmenter. Free/open-source.
+RVM_MODEL = {
+    "file": "rvm_mobilenetv3_fp32.onnx",
+    "url": "https://github.com/PeterL1n/RobustVideoMatting/releases/download/"
+           "v1.0.0/rvm_mobilenetv3_fp32.onnx",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
-def ensure_model(name: str) -> Path:
-    """Return the local path to the model, downloading it on first use."""
-    spec = MODELS[name]
-    path = MODEL_DIR / spec["file"]
+def _download_model(file: str, url: str, label: str) -> Path:
+    """Return a local model path, downloading it on first use."""
+    path = MODEL_DIR / file
     if path.is_file() and path.stat().st_size > 0:
         return path
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[vcam] Downloading '{name}' model -> {path} ...")
+    print(f"[vcam] Downloading {label} model -> {path} ...")
     try:
-        urllib.request.urlretrieve(spec["url"], path)
+        urllib.request.urlretrieve(url, path)
     except Exception as exc:  # noqa: BLE001
-        sys.exit(f"Failed to download model: {exc}\nURL: {spec['url']}")
+        sys.exit(f"Failed to download model: {exc}\nURL: {url}")
     print("[vcam] Model ready.")
     return path
+
+
+def ensure_model(name: str) -> Path:
+    spec = MODELS[name]
+    return _download_model(spec["file"], spec["url"], f"selfie '{name}'")
+
+
+def ensure_rvm_model() -> Path:
+    return _download_model(RVM_MODEL["file"], RVM_MODEL["url"], "RobustVideoMatting")
 
 
 def make_segmenter(model_path: Path) -> mp_vision.ImageSegmenter:
@@ -347,10 +368,122 @@ class Compositor:
         return self._out
 
 
-def run(args: argparse.Namespace) -> int:
-    model_path = ensure_model(args.model)
-    segmenter = make_segmenter(model_path)
+# --------------------------------------------------------------------------- #
+# Matting engines — each turns a BGR frame into (alpha matte, foreground|None)
+# --------------------------------------------------------------------------- #
+class RvmEngine:
+    """RobustVideoMatting via onnxruntime — high-quality, temporally-coherent
+    video matting. The recurrent state (r1..r4, fed back every frame) is what
+    keeps hair/hands/edges stable under motion, so no extra temporal smoothing
+    or guided-filter hacks are needed. Returns a soft alpha and a colour-
+    decontaminated foreground (clean hair edges, no old-background colour bleed).
+    """
 
+    def __init__(self, width, height, *, downsample=None, single_person=True, threads=0):
+        if ort is None:
+            raise RuntimeError("onnxruntime is not installed (pip install onnxruntime)")
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads          # 0 = use all cores
+        self.sess = ort.InferenceSession(
+            str(ensure_rvm_model()), so, providers=["CPUExecutionProvider"]
+        )
+        self.w, self.h = width, height
+        self.single = bool(single_person)
+        # downsample_ratio targets a ~512px internal working size unless overridden.
+        self.dsr = float(downsample) if downsample else float(
+            np.clip(512.0 / max(width, height), 0.25, 1.0)
+        )
+        self._rec = [np.zeros([1, 1, 1, 1], np.float32) for _ in range(4)]
+        self._dsr = np.array([self.dsr], np.float32)
+
+    def process(self, frame_bgr):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        src = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])     # 1x3xHxW
+        fgr, pha, *self._rec = self.sess.run(
+            [], {"src": src, "r1i": self._rec[0], "r2i": self._rec[1],
+                 "r3i": self._rec[2], "r4i": self._rec[3], "downsample_ratio": self._dsr}
+        )
+        alpha = pha[0, 0]                                            # HxW float [0,1]
+        if self.single:
+            alpha = _keep_largest(alpha)
+        fg_bgr = cv2.cvtColor(
+            (np.clip(fgr[0].transpose(1, 2, 0), 0.0, 1.0) * 255.0).astype(np.uint8),
+            cv2.COLOR_RGB2BGR,
+        )
+        return alpha, fg_bgr
+
+    def close(self):
+        pass
+
+
+class MediaPipeEngine:
+    """Lightweight MediaPipe selfie segmentation + the sharpening MaskRefiner.
+    Fast and dependency-light, but weaker on hands-near-camera, motion and hair.
+    """
+
+    def __init__(self, width, height, args):
+        self.segmenter = make_segmenter(ensure_model(args.model))
+        self.refiner = MaskRefiner(
+            width, height,
+            threshold=args.threshold, feather=args.feather, erode=args.erode,
+            radius=args.edge_radius, temporal=args.temporal,
+            single_person=not args.multi_person, scale=args.mask_scale,
+        )
+        self._t0 = time.time()
+        self._ts = 0
+
+    def process(self, frame_bgr):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        self._ts = max(self._ts + 1, int((time.time() - self._t0) * 1000))
+        result = self.segmenter.segment_for_video(mp_image, self._ts)
+        mask = result.confidence_masks[0].numpy_view()
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        return self.refiner.refine(frame_bgr, mask), None       # no foreground decontamination
+
+    def close(self):
+        self.segmenter.close()
+
+
+def _keep_largest(alpha):
+    """Keep only the single largest person blob in a soft alpha matte; suppress
+    the rest while preserving the kept subject's soft edges."""
+    binary = (alpha > 0.5).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n <= 1:
+        return alpha
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    keep = (labels == biggest).astype(np.uint8)
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    return alpha * keep
+
+
+def make_engine(args, width, height):
+    """Pick the matting engine: RVM if available (best quality), else MediaPipe."""
+    want = args.engine
+    if want == "auto":
+        want = "rvm" if ort is not None else "mediapipe"
+    if want == "rvm":
+        if ort is None:
+            print("[vcam] onnxruntime not installed -> falling back to MediaPipe. "
+                  "For best quality: pip install onnxruntime")
+            want = "mediapipe"
+        else:
+            try:
+                engine = RvmEngine(width, height,
+                                   downsample=args.downsample,
+                                   single_person=not args.multi_person)
+                print(f"[vcam] Engine: RobustVideoMatting (downsample_ratio={engine.dsr:.2f})")
+                return engine
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vcam] RVM unavailable ({exc}) -> falling back to MediaPipe.")
+                want = "mediapipe"
+    print("[vcam] Engine: MediaPipe selfie segmentation")
+    return MediaPipeEngine(width, height, args)
+
+
+def run(args: argparse.Namespace) -> int:
     cap = open_camera(args.camera, args.width, args.height, args.fps)
 
     # The camera may not honor the requested size; use what we actually get.
@@ -380,12 +513,7 @@ def run(args: argparse.Namespace) -> int:
         blur_bg = True  # sensible default: blur the real background
         print("[vcam] No background specified -> blurring the real background.")
 
-    refiner = MaskRefiner(
-        width, height,
-        threshold=args.threshold, feather=args.feather, erode=args.erode,
-        radius=args.edge_radius, temporal=args.temporal,
-        single_person=not args.multi_person, scale=args.mask_scale,
-    )
+    engine = make_engine(args, width, height)
     compositor = Compositor(width, height, background_bgr, blur_bg)
 
     # Try to open the virtual camera; degrade gracefully to preview-only.
@@ -407,7 +535,6 @@ def run(args: argparse.Namespace) -> int:
 
     show_preview = not args.no_preview
     frames, t0 = 0, time.time()
-    timestamp_ms = 0
     last_seq = -1
     try:
         while True:
@@ -426,19 +553,9 @@ def run(args: argparse.Namespace) -> int:
             if args.mirror:
                 frame_bgr = cv2.flip(frame_bgr, 1)
 
-            # MediaPipe Tasks wants an mp.Image in SRGB (RGB) order.
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-            # VIDEO mode requires strictly increasing timestamps (ms).
-            timestamp_ms = max(timestamp_ms + 1, int((time.time() - t0) * 1000))
-            result = segmenter.segment_for_video(mp_image, timestamp_ms)
-            mask = result.confidence_masks[0].numpy_view()  # HxWx1 float32, 1 == person
-            if mask.ndim == 3:
-                mask = mask[:, :, 0]
-
-            alpha = refiner.refine(frame_bgr, mask)          # sharp, single-person matte
-            out_bgr = compositor.render(frame_bgr, alpha)
+            alpha, foreground = engine.process(frame_bgr)
+            # RVM returns a colour-decontaminated foreground; otherwise use the frame.
+            out_bgr = compositor.render(foreground if foreground is not None else frame_bgr, alpha)
 
             if upscaling:
                 out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
@@ -462,7 +579,7 @@ def run(args: argparse.Namespace) -> int:
     finally:
         grabber.stop()
         cap.release()
-        segmenter.close()
+        engine.close()
         if cam is not None:
             cam.close()
         if show_preview:
@@ -472,13 +589,20 @@ def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Real-time webcam background replacement via MediaPipe + pyvirtualcam.",
+        description="Real-time webcam virtual background (RobustVideoMatting / MediaPipe) "
+                    "published as a system virtual camera via pyvirtualcam.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     bg = p.add_mutually_exclusive_group()
     bg.add_argument("--background", "-b", metavar="PATH", help="background image to composite behind you")
     bg.add_argument("--blur", action="store_true", help="blur the real background instead of replacing it")
     bg.add_argument("--color", type=parse_color, metavar="R,G,B", help="solid color background, e.g. 0,177,64")
+
+    p.add_argument("--engine", choices=("auto", "rvm", "mediapipe"), default="auto",
+                   help="matting engine: 'rvm' (RobustVideoMatting, best quality) or 'mediapipe' "
+                        "(faster, lighter). 'auto' uses rvm when onnxruntime is installed.")
+    p.add_argument("--downsample", type=float, default=None,
+                   help="[rvm] internal downsample_ratio 0-1 (auto by default; lower = faster, softer hair)")
 
     p.add_argument("--camera", "-c", type=int, default=0, help="webcam device index")
     p.add_argument("--width", type=int, default=1280, help="capture width")
@@ -489,13 +613,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="virtual-cam output height (default: same as capture)")
     p.add_argument("--fps", type=int, default=30, help="target frames per second")
     p.add_argument("--model", choices=("general", "landscape"), default="general",
-                   help="MediaPipe model: 'general' (square) or 'landscape' (wide, slightly faster)")
-    p.add_argument("--threshold", type=float, default=0.5, help="mask cutoff (0-1); lower keeps more of you")
-    p.add_argument("--feather", type=int, default=1, help="edge anti-alias radius in px (0 = hardest edge)")
+                   help="[mediapipe] model: 'general' (square) or 'landscape' (wide, slightly faster)")
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="[mediapipe] mask cutoff (0-1); lower keeps more of you")
+    p.add_argument("--feather", type=int, default=1,
+                   help="[mediapipe] edge anti-alias radius in px (0 = hardest edge)")
     p.add_argument("--edge-radius", type=int, default=12,
-                   help="edge-refinement strength (guided filter); higher hugs broad edges, lower keeps fine detail")
+                   help="[mediapipe] edge-refinement strength (guided filter); higher hugs broad edges")
     p.add_argument("--erode", type=int, default=1,
-                   help="shrink the cutout by N px to remove the background halo (0 = none)")
+                   help="[mediapipe] shrink the cutout by N px to remove the background halo (0 = none)")
     p.add_argument("--temporal", type=float, default=0.5,
                    help="temporal smoothing 0-1 (weight of current frame); lower = steadier, 1 = off")
     p.add_argument("--multi-person", action="store_true",

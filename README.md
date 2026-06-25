@@ -1,17 +1,26 @@
 # vcam — real-time webcam virtual background
 
-Replace your real background in real time using **Google MediaPipe Selfie
-Segmentation**, and expose the result as a **system virtual camera** (via
-`pyvirtualcam`) that any app — Google Meet, Zoom, Teams, Discord, OBS — can
-select like a normal webcam.
+Replace your real background in real time and expose the result as a **system
+virtual camera** (via `pyvirtualcam`) that any app — Google Meet, Zoom, Teams,
+Discord, OBS — can select like a normal webcam.
 
-Tuned to look real, not "virtual": it isolates a **single person** with a
-**sharp, edge-hugging cutout**, removes everything outside that edge (no halo),
-and stays flicker-free against a still background image.
+Two matting engines:
 
-100% local. No cloud, no account, no subscription. The segmentation model is
-Google's free, open-source `selfie_segmenter` (`.tflite`), downloaded
-automatically on first run.
+- **RobustVideoMatting (RVM)** — *default.* A real-time video matting model with
+  **temporal coherence** (recurrent state), so it holds up where the lightweight
+  models tear: a **hand raised toward the camera**, fast motion, and hair detail.
+  This is what gets close to Meet/Teams quality instead of looking like a cutout.
+- **MediaPipe Selfie Segmentation** — lighter/faster fallback, with sharpening
+  (guided-filter edge refinement, single-person isolation, motion-adaptive
+  temporal smoothing).
+
+It isolates a **single person**, keeps a clean edge with **no halo**, and uses
+RVM's colour-decontaminated foreground so hair edges don't bleed the old
+background.
+
+100% local. No cloud, no account, no subscription. Models (Google's
+`selfie_segmenter.tflite` and PeterL1n's `rvm_mobilenetv3_fp32.onnx`, both free
+and open-source) download automatically on first run.
 
 ---
 
@@ -21,7 +30,10 @@ automatically on first run.
 pip install -r requirements.txt
 ```
 
-Python 3.9–3.13 supported.
+Python 3.9–3.13 supported. `onnxruntime` powers the RVM engine — if it's missing,
+vcam automatically falls back to MediaPipe. On Windows/Intel-iGPU stick with the
+**CPU** build of onnxruntime (DirectML has correctness/perf issues with RVM's
+recurrent state); CPU runs ~20 fps at 720p, which exceeds most webcams' frame rate.
 
 ### Virtual-camera backend (required to feed other apps)
 
@@ -71,55 +83,50 @@ Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 | `--background, -b PATH` | — | Background image to composite behind you |
 | `--blur` | — | Blur the real background instead of replacing it |
 | `--color R,G,B` | — | Solid color background, e.g. `0,177,64` |
+| `--engine` | `auto` | `rvm` (best), `mediapipe` (lighter), or `auto` |
+| `--downsample` | auto | [rvm] internal ratio 0–1; lower = faster, softer hair |
 | `--camera, -c N` | `0` | Webcam device index (try 0, 1, 2…) |
 | `--width` / `--height` | `1280` / `720` | **Capture** resolution (what the camera delivers) |
 | `--out-width` / `--out-height` | = capture | **Output** resolution. Capture small/fast, upscale the result (see Performance) |
 | `--fps` | `30` | Target frame rate |
 | `--model` | `general` | `general` (square) or `landscape` (wide, slightly faster) |
 | `--threshold` | `0.5` | Mask cutoff 0–1; lower keeps more of you |
-| `--feather` | `1` | Edge anti-alias radius in px (`0` = hardest edge) |
-| `--edge-radius` | `12` | Edge-refinement strength (guided filter). Higher hugs broad edges; lower keeps fine detail |
-| `--erode` | `1` | Shrink the cutout by N px to kill the background halo (`0` = none) |
-| `--temporal` | `0.5` | Temporal smoothing 0–1 (weight of current frame). Lower = steadier; `1` = off |
-| `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
-| `--mask-scale` | `1.0` | Resolution scale for edge refinement (`0.5` = faster, slightly softer) |
 | `--mirror` | off | Horizontally flip (selfie view) |
+| `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
 | `--no-preview` | off | Don't open the preview window |
 | `--no-virtualcam` | off | Preview only; don't open a virtual camera |
+
+These only affect the **MediaPipe** engine (ignored by RVM): `--model`,
+`--threshold`, `--feather`, `--edge-radius`, `--erode`, `--temporal`,
+`--mask-scale`. See `python vcam.py --help`.
 
 ---
 
 ## 4. How it works
 
 ```
-webcam ─► OpenCV capture ─► MediaPipe ImageSegmenter ─► raw confidence mask
-                                                              │
-        guided filter (snap to real edges) ◄──────────────────┤
-        motion-adaptive temporal smoothing (no flicker/ghost)  │
-        threshold ─► keep largest blob (ONE person)            │
-        fill holes ─► erode 1px (no halo) ─► 1px feather        ▼
-                                              sharp alpha matte
-                                                              │
-                 background image / blur / color ─────────────┤
-                                                              ▼
-                                  alpha composite ─► pyvirtualcam ─► system camera
+webcam ─► capture ─► matting engine ─► alpha matte (+ foreground)
+                                                  │
+                 background image / blur / color ─┤
+                                                  ▼
+                       alpha composite ─► pyvirtualcam ─► system camera
 ```
 
-The **mask pipeline** is what makes the cutout look real rather than virtual:
+**RVM engine (default).** RobustVideoMatting is a recurrent video matting network:
+each frame it consumes the previous frame's hidden state and emits a new one, so
+the matte is **temporally coherent** — stable hair, hands, and edges under motion
+instead of the per-frame flicker/tearing the lightweight models produce. It also
+outputs a colour-decontaminated foreground, so composited hair edges don't carry
+the old background's colour. Run on the onnxruntime **CPU** provider
+(`models/rvm_mobilenetv3_fp32.onnx`, auto-downloaded). Only post-processing is
+optional single-person isolation.
 
-- **Guided filter** (`cv2.ximgproc.guidedFilter`) snaps the fuzzy model mask onto
-  the actual image edges — hair, shoulders, headphones — so the cut hugs the guy.
-- **Largest connected component** keeps exactly one person; any other object or
-  person in frame is dropped (`--multi-person` to keep all).
-- **Erode + threshold** remove everything outside the edge completely (no halo).
-- **Motion-adaptive temporal smoothing** kills flicker against a still background
-  where you're steady, but follows you where you move — so there are no ghost trails.
-
-The script uses MediaPipe's **Tasks API** (`ImageSegmenter`, VIDEO mode). The
-older `mp.solutions.selfie_segmentation` API was removed in MediaPipe 0.10.30+;
-this project uses the current model file (`models/selfie_segmenter.tflite`),
-fetched automatically. Edge refinement needs `opencv-contrib-python` (for
-`cv2.ximgproc`); without it edges fall back to softer feathering.
+**MediaPipe engine (fallback).** MediaPipe's **Tasks API** `ImageSegmenter`
+(VIDEO mode) gives a soft confidence mask, then a sharpening pipeline: guided
+filter (`cv2.ximgproc`) snaps the mask to real edges → motion-adaptive temporal
+smoothing → threshold → keep the largest blob (one person) → erode (no halo) →
+feather. Needs `opencv-contrib-python` for `cv2.ximgproc`; without it edges fall
+back to softer feathering.
 
 ---
 
@@ -160,14 +167,15 @@ frame rate automatically — add light before blaming the code.
   or another script). Close it, or use a different `--camera` index.
 - **"could not start a virtual camera"** → install OBS Studio (see step 1) so a
   virtual-camera driver exists, then re-run.
-- **Halo / background bleeding around you** → raise `--erode` (e.g. `2`).
-- **Edge too soft / not crisp** → lower `--feather` to `0`, and/or lower
-  `--edge-radius` (e.g. `8`) to keep fine detail.
-- **Bits of you get cut off** → lower `--threshold` (e.g. `0.4`).
-- **A second person/object shows up** → that shouldn't happen (only the largest
-  person is kept); pass `--multi-person` if you actually want to keep everyone.
-- **Flicker against the background** → lower `--temporal` (e.g. `0.3`).
-- **Ghost trail when you move fast** → raise `--temporal` toward `1` (less smoothing).
-- **Low FPS** → see [Performance](#5-performance). Lower the **capture** resolution
-  (e.g. `--width 640 --height 480`, add `--out-width 1280 --out-height 720` for a
-  720p stream), use `--mask-scale 0.5`, add light, or try `--no-preview`.
+- **Torn / tearing edges around a raised hand or on motion** → you're on the
+  MediaPipe engine; use the default **RVM** engine (`pip install onnxruntime`,
+  `--engine rvm`). RVM is built for exactly this.
+- **RVM too slow** → lower `--downsample` (e.g. `0.3`), or drop the **capture**
+  resolution (`--width 640 --height 480`, then `--out-width 1280 --out-height 720`).
+- **A second person/object shows up** → only the largest person is kept by
+  default; pass `--multi-person` to keep everyone.
+- **(MediaPipe engine) halo** → raise `--erode`; **soft edge** → `--feather 0`;
+  **bits cut off** → `--threshold 0.4`; **flicker** → `--temporal 0.3`;
+  **ghost trail on motion** → `--temporal 1`.
+- **Low FPS** → see [Performance](#5-performance): lower **capture** resolution
+  (and `--out-width/--out-height` for a 720p stream), add light, `--no-preview`.

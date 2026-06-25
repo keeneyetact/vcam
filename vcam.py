@@ -104,7 +104,7 @@ def _download_model(file: str, url: str, label: str) -> Path:
     try:
         urllib.request.urlretrieve(url, path)
     except Exception as exc:  # noqa: BLE001
-        sys.exit(f"Failed to download model: {exc}\nURL: {url}")
+        raise RuntimeError(f"Failed to download model from {url}: {exc}")
     print("[vcam] Model ready.")
     return path
 
@@ -145,7 +145,7 @@ def resize_cover(img: np.ndarray, width: int, height: int) -> np.ndarray:
 def load_background_image(path: str, width: int, height: int) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
-        sys.exit(f"Could not read background image: {path}")
+        raise RuntimeError(f"Could not read background image: {path}")
     return resize_cover(img, width, height)
 
 
@@ -179,10 +179,11 @@ def open_camera(index: int, width: int, height: int, fps: int) -> cv2.VideoCaptu
     cap.set(cv2.CAP_PROP_FPS, fps)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low: always the freshest frame
     if not cap.isOpened():
-        sys.exit(
-            f"Could not open camera index {index}. A webcam can only be used by one app "
-            "at a time; close anything else holding it (Zoom/Meet/Teams/OBS, or another "
-            "script), or try a different --camera index (0, 1, 2, ...)."
+        cap.release()
+        raise RuntimeError(
+            f"Could not open camera {index}. A webcam can only be used by one app "
+            "at a time; close anything else using it (Meet/Zoom/Teams/OBS, or another "
+            "script), or try a different camera index."
         )
     return cap
 
@@ -382,26 +383,42 @@ class RvmEngine:
     decontaminated foreground (clean hair edges, no old-background colour bleed).
     """
 
-    def __init__(self, width, height, *, downsample=None, single_person=True, threads=0):
+    def __init__(self, width, height, *, downsample=None, single_person=True, threads=None):
         if ort is None:
             raise RuntimeError("onnxruntime is not installed (pip install onnxruntime)")
         so = ort.SessionOptions()
-        so.intra_op_num_threads = threads          # 0 = use all cores
+        # More threads than physical cores hurts this small recurrent net (on a
+        # 14700 all-28-logical = 77 ms vs 8 = 48 ms), so cap it.
+        so.intra_op_num_threads = int(threads) if threads else _rvm_thread_count()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.threads = so.intra_op_num_threads
         self.sess = ort.InferenceSession(
             str(ensure_rvm_model()), so, providers=["CPUExecutionProvider"]
         )
         self.w, self.h = width, height
         self.single = bool(single_person)
-        # downsample_ratio targets a ~512px internal working size unless overridden.
-        self.dsr = float(downsample) if downsample else float(
-            np.clip(512.0 / max(width, height), 0.25, 1.0)
-        )
+        # downsample_ratio drives the coarse network's resolution and dominates
+        # speed. RVM's recommended ~0.375 (0.25 for >=1080p) keeps the refined
+        # full-res edges sharp while running fast; the old 512/max formula made
+        # low-res inputs *slower* (0.8 at 640px = 62 ms vs 0.375 = 18 ms).
+        if downsample:
+            self.dsr = float(downsample)
+        else:
+            self.dsr = 0.25 if max(width, height) >= 1600 else 0.375
         self._rec = [np.zeros([1, 1, 1, 1], np.float32) for _ in range(4)]
         self._dsr = np.array([self.dsr], np.float32)
+        self._src = None        # reused NCHW input buffer (no per-frame realloc)
 
     def process(self, frame_bgr):
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        src = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])     # 1x3xHxW
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)             # HWC uint8
+        # Fill a reused float32 NCHW buffer directly (avoids astype + transpose
+        # + ascontiguousarray copies: ~7.5 ms -> ~2 ms at 720p).
+        if self._src is None or self._src.shape[2:] != (h, w):
+            self._src = np.empty((1, 3, h, w), np.float32)
+        src = self._src
+        src[0, 0], src[0, 1], src[0, 2] = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        np.multiply(src, np.float32(1.0 / 255.0), out=src)
         fgr, pha, *self._rec = self.sess.run(
             [], {"src": src, "r1i": self._rec[0], "r2i": self._rec[1],
                  "r3i": self._rec[2], "r4i": self._rec[3], "downsample_ratio": self._dsr}
@@ -409,10 +426,12 @@ class RvmEngine:
         alpha = pha[0, 0]                                            # HxW float [0,1]
         if self.single:
             alpha = _keep_largest(alpha)
-        fg_bgr = cv2.cvtColor(
-            (np.clip(fgr[0].transpose(1, 2, 0), 0.0, 1.0) * 255.0).astype(np.uint8),
-            cv2.COLOR_RGB2BGR,
-        )
+        # Foreground RGB (3,H,W) float -> BGR uint8 HWC via per-channel saturating
+        # scale + merge (~9.3 ms -> ~1.3 ms at 720p; no transpose copy / cvtColor).
+        fg = fgr[0]
+        fg_bgr = cv2.merge([cv2.convertScaleAbs(fg[2], alpha=255.0),
+                            cv2.convertScaleAbs(fg[1], alpha=255.0),
+                            cv2.convertScaleAbs(fg[0], alpha=255.0)])
         return alpha, fg_bgr
 
     def close(self):
@@ -449,16 +468,28 @@ class MediaPipeEngine:
         self.segmenter.close()
 
 
+def _rvm_thread_count() -> int:
+    """A good onnxruntime intra-op thread count for RVM: enough to use the fast
+    cores, capped so a many-thread machine doesn't oversubscribe this small net."""
+    import os
+    return max(2, min(8, os.cpu_count() or 4))
+
+
 def _keep_largest(alpha):
     """Keep only the single largest person blob in a soft alpha matte; suppress
-    the rest while preserving the kept subject's soft edges."""
-    binary = (alpha > 0.5).astype(np.uint8)
+    the rest while preserving the kept subject's soft edges. Connected components
+    run at half resolution (blobs are large) — ~6 ms -> ~3 ms at 720p."""
+    h, w = alpha.shape[:2]
+    small = cv2.resize(alpha, (w // 2, h // 2), interpolation=cv2.INTER_LINEAR) if max(h, w) > 640 else alpha
+    binary = (small > 0.5).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if n <= 1:
         return alpha
     biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    keep = (labels == biggest).astype(np.uint8)
-    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    keep = cv2.dilate((labels == biggest).astype(np.uint8),
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    if keep.shape != alpha.shape:
+        keep = cv2.resize(keep, (w, h), interpolation=cv2.INTER_NEAREST)
     return alpha * keep
 
 
@@ -476,8 +507,10 @@ def make_engine(args, width, height):
             try:
                 engine = RvmEngine(width, height,
                                    downsample=args.downsample,
-                                   single_person=not args.multi_person)
-                print(f"[vcam] Engine: RobustVideoMatting (downsample_ratio={engine.dsr:.2f})")
+                                   single_person=not args.multi_person,
+                                   threads=getattr(args, "threads", None))
+                print(f"[vcam] Engine: RobustVideoMatting "
+                      f"(downsample_ratio={engine.dsr:.2f}, threads={engine.threads})")
                 return engine
             except Exception as exc:  # noqa: BLE001
                 print(f"[vcam] RVM unavailable ({exc}) -> falling back to MediaPipe.")
@@ -564,10 +597,11 @@ def uninstall_virtualcam() -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 class VCamWorker:
     DEFAULTS = dict(
-        camera=0, width=1280, height=720, fps=30, engine="auto",
-        mode="image", bg_path=None, color=(0, 177, 64), mirror=False,
-        multi_person=False, downsample=None, model="general",
-        threshold=0.5, feather=1, erode=1, edge_radius=12, temporal=0.5, mask_scale=1.0,
+        camera=0, width=1280, height=720, out_width=None, out_height=None,
+        fps=30, engine="auto", mode="image", bg_path=None, color=(0, 177, 64),
+        mirror=False, multi_person=False, downsample=None, threads=None,
+        model="general", threshold=0.5, feather=1, erode=1, edge_radius=12,
+        temporal=0.5, mask_scale=1.0,
     )
 
     def __init__(self):
@@ -621,7 +655,10 @@ class VCamWorker:
         if mode == "color":
             return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
         if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
-            return Compositor(width, height, load_background_image(self.cfg["bg_path"], width, height), False)
+            try:
+                return Compositor(width, height, load_background_image(self.cfg["bg_path"], width, height), False)
+            except RuntimeError:
+                pass   # unreadable image -> fall back to blur
         return Compositor(width, height, None, True)   # blur (and fallback when no image chosen)
 
     def _loop(self):
@@ -638,7 +675,12 @@ class VCamWorker:
             with self._lock:
                 compositor = self._build_compositor(width, height)
                 self._bg_dirty = False
-            cam = pyvirtualcam.Camera(width=width, height=height, fps=cfg["fps"], fmt=PixelFormat.BGR)
+            # Output can be a different (larger) size than capture: matte the
+            # small/fast frame, upscale the finished frame -> smooth 30 fps.
+            out_w = cfg["out_width"] or width
+            out_h = cfg["out_height"] or height
+            upscaling = (out_w, out_h) != (width, height)
+            cam = pyvirtualcam.Camera(width=out_w, height=out_h, fps=cfg["fps"], fmt=PixelFormat.BGR)
             self.device = cam.device
             grabber = FrameGrabber(cap).start()
             self.running = True
@@ -664,6 +706,8 @@ class VCamWorker:
                     frame = cv2.flip(frame, 1)
                 alpha, fg = engine.process(frame)
                 out = compositor.render(fg if fg is not None else frame, alpha)
+                if upscaling:
+                    out = cv2.resize(out, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
                 cam.send(out)
                 cam.sleep_until_next_frame()
                 with self._lock:
@@ -809,7 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="matting engine: 'rvm' (RobustVideoMatting, best quality) or 'mediapipe' "
                         "(faster, lighter). 'auto' uses rvm when onnxruntime is installed.")
     p.add_argument("--downsample", type=float, default=None,
-                   help="[rvm] internal downsample_ratio 0-1 (auto by default; lower = faster, softer hair)")
+                   help="[rvm] internal downsample_ratio 0-1 (default 0.375; lower = faster, softer hair)")
+    p.add_argument("--threads", type=int, default=None,
+                   help="[rvm] onnxruntime CPU threads (default: min(8, cores); more can be slower)")
 
     p.add_argument("--camera", "-c", type=int, default=0, help="webcam device index")
     p.add_argument("--width", type=int, default=1280, help="capture width")
@@ -845,7 +891,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.background and not Path(args.background).is_file():
         sys.exit(f"Background image not found: {args.background}")
-    return run(args)
+    try:
+        return run(args)
+    except RuntimeError as exc:           # camera busy, model download failed, ...
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":

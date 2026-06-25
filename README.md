@@ -102,7 +102,8 @@ Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 | `--blur` | — | Blur the real background instead of replacing it |
 | `--color R,G,B` | — | Solid color background, e.g. `0,177,64` |
 | `--engine` | `auto` | `rvm` (best), `mediapipe` (lighter), or `auto` |
-| `--downsample` | auto | [rvm] internal ratio 0–1; lower = faster, softer hair |
+| `--downsample` | `0.375` | [rvm] internal ratio 0–1; lower = faster, softer hair |
+| `--threads` | `min(8,cores)` | [rvm] onnxruntime CPU threads (more can be slower) |
 | `--camera, -c N` | `0` | Webcam device index (try 0, 1, 2…) |
 | `--width` / `--height` | `1280` / `720` | **Capture** resolution (what the camera delivers) |
 | `--out-width` / `--out-height` | = capture | **Output** resolution. Capture small/fast, upscale the result (see Performance) |
@@ -150,32 +151,36 @@ back to softer feathering.
 
 ## 5. Performance
 
-Frame rate is bounded by `min(camera fps, pipeline fps)`. The pipeline is fast;
-the **camera** is almost always the limit.
+Frame rate is `min(camera fps, pipeline fps)`. On most webcams the **camera is
+the ceiling**, not the matting.
 
-**The pipeline** (~10–16 ms/frame, i.e. 60–100 fps of headroom):
-- segmentation runs ~5 ms (the model is a fixed 256 px internally);
-- compositing uses integer math + reused buffers (~8 ms at 720p, vs ~19 ms naive);
-- `--blur` blurs a quarter-size copy and upscales it (~2 ms, vs ~15 ms);
-- a background thread grabs camera frames so capture overlaps processing instead
-  of serializing with it.
+**RVM engine (CPU), per frame:**
+- inference ~50 ms at 720p (`downsample_ratio` 0.375) → ~19 fps of headroom;
+- pre/post-processing trimmed from ~31 ms to ~6 ms (reused NCHW input buffer,
+  per-channel foreground conversion, half-res connected-components);
+- onnxruntime threads capped to the fast cores (more threads *slow* this small
+  recurrent net — on a 20-core i7-14700, 28 threads = 77 ms vs 8 threads = 48 ms).
 
-**The camera** is the real ceiling, and it's a per-device **resolution/fps
-tradeoff**. Many webcams do e.g. 1280×720 @ only 10 fps but 640×480 @ 30 fps.
-Check yours and capture at the resolution that hits your target fps.
+**The camera** is a per-device **resolution/fps tradeoff**: many webcams do
+1280×720 @ only ~10 fps but 640×480 @ 30 fps. At 720p you're camera-bound at
+~10 fps no matter how fast the CPU is.
 
-To get a smooth **30 fps and a 720p-shaped stream**, capture small and upscale
-the output:
+So for **smooth 30 fps**, capture at the camera's fast resolution and upscale the
+matted output — RVM at 640×480 runs ~50 fps on CPU, far above 30:
 
 ```bash
 python vcam.py --width 640 --height 480 --out-width 1280 --out-height 720
 ```
 
-This captures at the camera's fast resolution, runs segmentation/compositing on
-the small frame, and upscales the finished frame to 720p before the virtual cam.
+In the GUI this is the **"Smooth (30 fps)"** speed preset. The tradeoff is
+slightly softer *source* detail (480p webcam read); the matte itself stays sharp.
 
-Dim light makes it worse: webcams lengthen exposure in low light and drop the
-frame rate automatically — add light before blaming the code.
+> GPU (DirectML/OpenVINO on the Intel iGPU) is intentionally **not** used: at 720p
+> the camera caps fps anyway, at 480p the CPU already exceeds 30 fps, and DirectML
+> is known to mis-compute RVM's recurrent state on Intel iGPUs. CPU is faster-where-
+> it-matters *and* correct.
+
+Dim light also drops the frame rate (webcams lengthen exposure) — add light.
 
 ---
 

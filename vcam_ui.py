@@ -25,6 +25,14 @@ import vcam
 
 PREVIEW_W = 480
 
+# label -> (capture_w, capture_h, out_w, out_h). "Smooth" captures at a fast
+# low-res the webcam can deliver at 30 fps, then upscales the matted output.
+SPEED_MODES = {
+    "Sharp (720p, ~camera fps)": (1280, 720, None, None),
+    "Smooth (30 fps, upscaled)": (640, 480, 1280, 720),
+}
+SPEED_DEFAULT = "Sharp (720p, ~camera fps)"
+
 
 class VCamUI:
     def __init__(self, root: tk.Tk):
@@ -92,18 +100,22 @@ class VCamUI:
         # Options
         op = ttk.LabelFrame(left, text="4. Options")
         op.grid(row=3, column=0, sticky="ew", **pad)
-        ttk.Label(op, text="Engine").grid(row=0, column=0, sticky="e", **pad)
+        ttk.Label(op, text="Speed").grid(row=0, column=0, sticky="e", **pad)
+        self.quality = tk.StringVar(value=SPEED_DEFAULT)
+        ttk.Combobox(op, textvariable=self.quality, values=list(SPEED_MODES),
+                     width=20, state="readonly").grid(row=0, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(op, text="Engine").grid(row=1, column=0, sticky="e", **pad)
         self.engine = tk.StringVar(value="auto")
         ttk.Combobox(op, textvariable=self.engine, values=["auto", "rvm", "mediapipe"],
-                     width=10, state="readonly").grid(row=0, column=1, sticky="w", **pad)
+                     width=10, state="readonly").grid(row=1, column=1, sticky="w", **pad)
         self.mirror = tk.BooleanVar(value=False)
         ttk.Checkbutton(op, text="Mirror", variable=self.mirror,
-                        command=self._apply_opts).grid(row=0, column=2, sticky="w", **pad)
+                        command=self._apply_opts).grid(row=1, column=2, sticky="w", **pad)
         self.one_person = tk.BooleanVar(value=True)
         ttk.Checkbutton(op, text="Only one person", variable=self.one_person).grid(
-            row=1, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Label(op, text="(engine/camera/one-person apply on next ON)",
-                  foreground="#888").grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+            row=2, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(op, text="(speed/engine/camera/one-person apply on next ON)",
+                  foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
         # Right column: preview --------------------------------------------
         right = ttk.LabelFrame(self.root, text="Preview")
@@ -180,10 +192,12 @@ class VCamUI:
         mode = self.mode.get()
         if mode == "image" and not self.bg_path and not self._choose_image():
             return
+        cw, ch, ow, oh = SPEED_MODES[self.quality.get()]
         self.worker.configure(
             camera=self.cam_idx.get(), engine=self.engine.get(), mode=mode,
             bg_path=self.bg_path, mirror=self.mirror.get(),
-            multi_person=not self.one_person.get())
+            multi_person=not self.one_person.get(),
+            width=cw, height=ch, out_width=ow, out_height=oh)
         self.toggle_btn.config(text="Turn OFF")
         self.worker.start()
 

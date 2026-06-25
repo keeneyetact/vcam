@@ -1,0 +1,41 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="badge" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7C5CFC"/>
+      <stop offset="1" stop-color="#A855F7"/>
+    </linearGradient>
+    <linearGradient id="lensbg" x1="140" y1="120" x2="372" y2="392" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="person" x1="256" y1="150" x2="256" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EAF2FF"/>
+    </linearGradient>
+    <radialGradient id="topglow" cx="0.5" cy="0.18" r="0.7">
+      <stop stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="lensClip"><circle cx="256" cy="256" r="150"/></clipPath>
+  </defs>
+
+  <!-- app badge -->
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#badge)"/>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#topglow)"/>
+
+  <!-- camera lens -->
+  <circle cx="256" cy="256" r="150" fill="url(#lensbg)"/>
+
+  <!-- person bust = "you", with the lens background replaced behind you -->
+  <g clip-path="url(#lensClip)">
+    <circle cx="256" cy="214" r="54" fill="url(#person)"/>
+    <ellipse cx="256" cy="424" rx="116" ry="112" fill="url(#person)"/>
+  </g>
+
+  <!-- lens rings -->
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#FFFFFF" stroke-opacity="0.9" stroke-width="14"/>
+  <circle cx="256" cy="256" r="171" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="6"/>
+
+  <!-- camera-live LED -->
+  <circle cx="362" cy="150" r="26" fill="#34D399" stroke="#FFFFFF" stroke-width="8"/>
+</svg>

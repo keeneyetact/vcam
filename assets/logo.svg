@@ -1,0 +1,45 @@
+<svg width="1180" height="360" viewBox="0 0 1180 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="badge" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7C5CFC"/>
+      <stop offset="1" stop-color="#A855F7"/>
+    </linearGradient>
+    <linearGradient id="lensbg" x1="140" y1="120" x2="372" y2="392" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="person" x1="256" y1="150" x2="256" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EAF2FF"/>
+    </linearGradient>
+    <radialGradient id="topglow" cx="0.5" cy="0.18" r="0.7">
+      <stop stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wordmark" x1="372" y1="120" x2="372" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3B2E6E"/>
+      <stop offset="1" stop-color="#221A40"/>
+    </linearGradient>
+    <clipPath id="lensClip"><circle cx="256" cy="256" r="150"/></clipPath>
+  </defs>
+
+  <!-- icon (the 512 icon scaled to 300px, padded at left) -->
+  <g transform="translate(30,30) scale(0.586)">
+    <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#badge)"/>
+    <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#topglow)"/>
+    <circle cx="256" cy="256" r="150" fill="url(#lensbg)"/>
+    <g clip-path="url(#lensClip)">
+      <circle cx="256" cy="214" r="54" fill="url(#person)"/>
+      <ellipse cx="256" cy="424" rx="116" ry="112" fill="url(#person)"/>
+    </g>
+    <circle cx="256" cy="256" r="150" fill="none" stroke="#FFFFFF" stroke-opacity="0.9" stroke-width="14"/>
+    <circle cx="256" cy="256" r="171" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="6"/>
+    <circle cx="362" cy="150" r="26" fill="#34D399" stroke="#FFFFFF" stroke-width="8"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="372" y="208" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="168" font-weight="800" letter-spacing="-6" fill="url(#wordmark)">vcam</text>
+  <text x="380" y="266" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="31" font-weight="600" letter-spacing="3.4" fill="#7C5CFC">REAL-TIME VIRTUAL BACKGROUND</text>
+</svg>

@@ -6,7 +6,11 @@ Output: dist/vcam.exe
 """
 from PyInstaller.utils.hooks import collect_all
 
-datas = [("models/rvm_mobilenetv3_fp32.onnx", "models")]   # bundle the RVM model
+datas = [
+    ("models/rvm_mobilenetv3_fp32.onnx", "models"),        # bundle the RVM model
+    ("assets/icon.ico", "assets"),                          # window icon
+    ("assets/icon-256.png", "assets"),
+]
 binaries = []
 hiddenimports = []
 
@@ -47,5 +51,5 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,          # GUI app — no console window
     disable_windowed_traceback=False,
-    icon=None,
+    icon="assets/icon.ico",
 )

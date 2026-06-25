@@ -294,6 +294,25 @@ def _selftest() -> int:
     return 0 if ok else 1
 
 
+def _set_window_icon(root):
+    """Set the window/taskbar icon from assets (works from source and frozen)."""
+    assets = vcam.BUNDLE_DIR / "assets"
+    try:
+        ico = assets / "icon.ico"
+        if ico.is_file():
+            root.iconbitmap(default=str(ico))
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        png = assets / "icon-256.png"
+        if png.is_file():
+            root._icon_img = tk.PhotoImage(file=str(png))   # keep a reference
+            root.iconphoto(True, root._icon_img)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
@@ -302,6 +321,7 @@ def main():
         root.call("tk", "scaling", 1.2)
     except tk.TclError:
         pass
+    _set_window_icon(root)
     VCamUI(root)
     root.mainloop()
 

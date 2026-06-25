@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="vcam — real-time virtual background" width="540">
+</p>
+
 # vcam — real-time webcam virtual background
 
 Replace your real background in real time and expose the result as a **system

@@ -265,6 +265,10 @@ class VCamUI:
         self.root.after(40, self._tick)
 
     def _on_close(self):
+        msg = ("The virtual camera is ON — quit and turn it off?"
+               if self.worker.running else "Quit vcam?")
+        if not messagebox.askokcancel("Quit vcam", msg, icon="question"):
+            return
         try:
             self.worker.stop()
         finally:

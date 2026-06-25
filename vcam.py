@@ -33,9 +33,12 @@ downloaded automatically on first run into ``models/``.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import types
 import urllib.request
 from pathlib import Path
 
@@ -481,6 +484,210 @@ def make_engine(args, width, height):
                 want = "mediapipe"
     print("[vcam] Engine: MediaPipe selfie segmentation")
     return MediaPipeEngine(width, height, args)
+
+
+# --------------------------------------------------------------------------- #
+# Virtual-camera driver (Windows / OBS Virtual Camera DirectShow source)
+# --------------------------------------------------------------------------- #
+# CLSID of the OBS Virtual Camera DirectShow filter (stable across OBS 26+).
+OBS_VCAM_CLSID = "{A3FCE0F5-3493-419F-958A-ABA1250EC20B}"
+_OBS_VCAM_DLLS = [
+    r"C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll",
+    r"C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module32.dll",
+]
+
+
+def find_virtualcam_dlls() -> list[str]:
+    """Existing OBS Virtual Camera module DLL paths (64- and 32-bit)."""
+    return [p for p in _OBS_VCAM_DLLS if Path(p).is_file()]
+
+
+def virtualcam_installed() -> bool:
+    """True if the OBS Virtual Camera DirectShow source is registered system-wide."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Classes\CLSID\\" + OBS_VCAM_CLSID)
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+
+def virtualcam_status() -> dict:
+    dlls = find_virtualcam_dlls()
+    return {"installed": virtualcam_installed(), "obs_found": bool(dlls), "dlls": dlls}
+
+
+def _run_regsvr(dlls: list[str], unregister: bool) -> tuple[bool, str]:
+    """regsvr32 the DLLs with a single UAC elevation prompt, then verify."""
+    if not dlls:
+        return False, ("OBS Virtual Camera not found. Install OBS Studio "
+                       "(https://obsproject.com) — it provides the virtual-camera driver.")
+    flag = "/u /s" if unregister else "/s"
+    lines = ["@echo off"] + [f'regsvr32 {flag} "{d}"' for d in dlls]
+    bat = Path(tempfile.gettempdir()) / "vcam_virtualcam_setup.bat"
+    bat.write_text("\r\n".join(lines), encoding="ascii")
+    ps = f"Start-Process -FilePath '{bat}' -Verb RunAs -Wait"
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, text=True, timeout=180)
+    except Exception as exc:  # noqa: BLE001  (includes UAC cancellation)
+        return False, f"Elevation failed or was cancelled: {exc}"
+    finally:
+        try:
+            bat.unlink()
+        except OSError:
+            pass
+    # Trust the registry, not regsvr32's (often-zero) exit code.
+    now = virtualcam_installed()
+    if unregister:
+        return (not now), ("Virtual camera uninstalled." if not now
+                           else "Could not unregister (elevation cancelled?).")
+    return now, ("Virtual camera installed — pick 'OBS Virtual Camera' in your app."
+                 if now else "Registration did not take effect (elevation cancelled?).")
+
+
+def install_virtualcam() -> tuple[bool, str]:
+    return _run_regsvr(find_virtualcam_dlls(), unregister=False)
+
+
+def uninstall_virtualcam() -> tuple[bool, str]:
+    return _run_regsvr(find_virtualcam_dlls(), unregister=True)
+
+
+# --------------------------------------------------------------------------- #
+# Worker — runs the capture→matte→composite→virtual-cam loop in a thread so a
+# GUI can start/stop it and swap the background live.
+# --------------------------------------------------------------------------- #
+class VCamWorker:
+    DEFAULTS = dict(
+        camera=0, width=1280, height=720, fps=30, engine="auto",
+        mode="image", bg_path=None, color=(0, 177, 64), mirror=False,
+        multi_person=False, downsample=None, model="general",
+        threshold=0.5, feather=1, erode=1, edge_radius=12, temporal=0.5, mask_scale=1.0,
+    )
+
+    def __init__(self):
+        self._thread = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest = None          # latest processed BGR frame (for preview)
+        self._bg_dirty = False
+        self.running = False
+        self.status = "stopped"      # stopped | starting | running | error
+        self.error = None
+        self.fps = 0.0
+        self.device = None
+        self.cfg = dict(self.DEFAULTS)
+
+    # ---- public, thread-safe ----
+    def configure(self, **kw):
+        with self._lock:
+            self.cfg.update(kw)
+
+    def set_background(self, mode, path=None, color=None):
+        with self._lock:
+            self.cfg["mode"] = mode
+            if path is not None:
+                self.cfg["bg_path"] = path
+            if color is not None:
+                self.cfg["color"] = color
+            self._bg_dirty = True
+
+    def latest_frame(self):
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
+    def start(self):
+        if self.running:
+            return
+        self._stop.clear()
+        self.error = None
+        self.status = "starting"
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+    # ---- internal ----
+    def _build_compositor(self, width, height):
+        mode = self.cfg["mode"]
+        if mode == "color":
+            return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
+        if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
+            return Compositor(width, height, load_background_image(self.cfg["bg_path"], width, height), False)
+        return Compositor(width, height, None, True)   # blur (and fallback when no image chosen)
+
+    def _loop(self):
+        cap = cam = grabber = engine = None
+        try:
+            with self._lock:
+                cfg = dict(self.cfg)
+            if pyvirtualcam is None:
+                raise RuntimeError("pyvirtualcam is not installed")
+            cap = open_camera(cfg["camera"], cfg["width"], cfg["height"], cfg["fps"])
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or cfg["width"]
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or cfg["height"]
+            engine = make_engine(types.SimpleNamespace(**cfg), width, height)
+            with self._lock:
+                compositor = self._build_compositor(width, height)
+                self._bg_dirty = False
+            cam = pyvirtualcam.Camera(width=width, height=height, fps=cfg["fps"], fmt=PixelFormat.BGR)
+            self.device = cam.device
+            grabber = FrameGrabber(cap).start()
+            self.running = True
+            self.status = "running"
+            frames, t0, last_seq = 0, time.time(), -1
+            while not self._stop.is_set():
+                seq, frame = grabber.read()
+                if frame is None:
+                    if not grabber.running:
+                        raise RuntimeError("camera stopped delivering frames")
+                    time.sleep(0.002)
+                    continue
+                if seq == last_seq:
+                    time.sleep(0.002)
+                    continue
+                last_seq = seq
+                with self._lock:
+                    if self._bg_dirty:
+                        compositor = self._build_compositor(width, height)
+                        self._bg_dirty = False
+                    mirror = self.cfg["mirror"]
+                if mirror:
+                    frame = cv2.flip(frame, 1)
+                alpha, fg = engine.process(frame)
+                out = compositor.render(fg if fg is not None else frame, alpha)
+                cam.send(out)
+                cam.sleep_until_next_frame()
+                with self._lock:
+                    self._latest = out
+                frames += 1
+                if frames % 15 == 0:
+                    self.fps = frames / (time.time() - t0)
+        except Exception as exc:  # noqa: BLE001
+            self.error = str(exc)
+            self.status = "error"
+        finally:
+            if grabber:
+                grabber.stop()
+            if cap:
+                cap.release()
+            if engine:
+                engine.close()
+            if cam:
+                cam.close()
+            self.running = False
+            with self._lock:
+                self._latest = None
+            if self.status != "error":
+                self.status = "stopped"
 
 
 def run(args: argparse.Namespace) -> int:

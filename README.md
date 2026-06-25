@@ -50,6 +50,24 @@ install `v4l2loopback`.
 
 ## 2. Run
 
+### Option A — the GUI (easiest)
+
+```bash
+python vcam_ui.py
+```
+
+A small control panel:
+
+1. **Virtual camera** — Install / Uninstall the "OBS Virtual Camera" (so Meet can
+   see it). Shows whether it's currently installed. (Install/Uninstall need admin;
+   a Windows UAC prompt appears.)
+2. **Camera on / off** — start/stop feeding the virtual camera (ON = your webcam
+   is in use).
+3. **Background** — Blur, Image (pick any file), or Green screen — switchable live.
+4. Live preview, engine choice (RVM/MediaPipe), mirror, single-person toggle.
+
+### Option B — the command line
+
 ```bash
 # Virtual background from an image (the main use case)
 python vcam.py --background 2.png

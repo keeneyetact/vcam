@@ -10,3 +10,5 @@ numpy>=1.24
 # to MediaPipe. CPU build is recommended on Windows/Intel iGPU (DirectML has
 # correctness/perf issues with RVM's recurrent state).
 onnxruntime>=1.18
+# GUI control panel (vcam_ui.py): preview thumbnails. tkinter ships with Python.
+pillow>=9

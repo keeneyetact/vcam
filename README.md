@@ -24,7 +24,29 @@ and open-source) download automatically on first run.
 
 ---
 
-## 1. Install
+## 0. Standalone .exe (Windows, no Python needed)
+
+Want to just double-click and run? Build a single self-contained `vcam.exe`:
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm vcam.spec      # -> dist/vcam.exe
+```
+
+`dist/vcam.exe` bundles Python, the RVM model, and all dependencies — copy it to
+any **Windows 10/11 (64-bit)** PC and double-click; no install required.
+
+Two caveats for "any computer":
+- It's a **Windows x64** binary (build separately for macOS/Linux).
+- The **virtual-camera output needs the OBS Virtual Camera** driver on the target
+  PC (install [OBS Studio](https://obsproject.com) once — the app's **Install**
+  button then registers it). Without it the app still runs and previews; it just
+  can't appear as a camera in Meet. The RVM model is bundled, so no internet is
+  needed for matting.
+
+---
+
+## 1. Install (from source)
 
 ```bash
 pip install -r requirements.txt

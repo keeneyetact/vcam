@@ -13,10 +13,20 @@ Then in Google Meet:  Settings -> Video -> Camera -> "OBS Virtual Camera".
 """
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+# A PyInstaller --windowed .exe has no console: sys.stdout/stderr are None, and
+# the library's print() calls would crash. Route them to a sink before anything
+# else imports / runs.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 import cv2
 from PIL import Image, ImageTk
@@ -261,7 +271,32 @@ class VCamUI:
             self.root.destroy()
 
 
+def _selftest() -> int:
+    """`vcam.exe --selftest`: exercise the bundle (onnxruntime + cv2 + RVM model)
+    without a camera/GUI, writing the result to vcam_selftest.txt (handy because
+    the windowed build has no console)."""
+    import numpy as np
+    lines, ok = [], True
+    try:
+        eng = vcam.RvmEngine(640, 480)
+        a, fg = eng.process((np.random.rand(480, 640, 3) * 255).astype("uint8"))
+        lines.append(f"RVM OK: alpha{a.shape} fg{fg.shape} dsr={eng.dsr} threads={eng.threads}")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        lines.append(f"RVM FAIL: {exc!r}")
+    lines.append(f"virtualcam_installed={vcam.virtualcam_installed()}")
+    report = ("PASS\n" if ok else "FAIL\n") + "\n".join(lines)
+    try:
+        Path("vcam_selftest.txt").write_text(report, encoding="ascii", errors="replace")
+    except OSError:
+        pass
+    print(report)
+    return 0 if ok else 1
+
+
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.2)

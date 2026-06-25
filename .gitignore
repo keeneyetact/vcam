@@ -12,3 +12,8 @@ models/*.onnx
 # Local backgrounds / scratch
 backgrounds/*.local.*
 *.log
+
+# PyInstaller build output (keep vcam.spec; ignore the artifacts)
+build/
+dist/
+*.exe

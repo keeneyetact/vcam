@@ -33,6 +33,7 @@ downloaded automatically on first run into ``models/``.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -45,12 +46,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# MediaPipe is optional: the RVM engine is the default and doesn't need it, and
+# the packaged .exe ships without it. None == "MediaPipe engine unavailable".
 try:
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 except ImportError:  # pragma: no cover
-    sys.exit("mediapipe is not installed. Run:  pip install -r requirements.txt")
+    mp = mp_python = mp_vision = None
 
 try:
     import pyvirtualcam
@@ -66,7 +69,18 @@ except ImportError:  # pragma: no cover
 
 
 HERE = Path(__file__).resolve().parent
+# When frozen by PyInstaller, bundled data lives under sys._MEIPASS.
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", HERE))
 MODEL_DIR = HERE / "models"
+
+
+def _writable_model_dir() -> Path:
+    """Where to cache a downloaded model (the .exe's extract dir is read-only/
+    temporary, so write to %LOCALAPPDATA%/vcam when frozen)."""
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "vcam"
+        return base / "models"
+    return MODEL_DIR
 
 # Official Google MediaPipe selfie-segmentation models (free / open-source).
 MODELS = {
@@ -95,11 +109,13 @@ RVM_MODEL = {
 # Model
 # --------------------------------------------------------------------------- #
 def _download_model(file: str, url: str, label: str) -> Path:
-    """Return a local model path, downloading it on first use."""
-    path = MODEL_DIR / file
-    if path.is_file() and path.stat().st_size > 0:
-        return path
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    """Return a local model path. Prefer a copy bundled into the .exe, then a
+    cached download, otherwise download it on first use."""
+    for cand in (BUNDLE_DIR / "models" / file, MODEL_DIR / file, _writable_model_dir() / file):
+        if cand.is_file() and cand.stat().st_size > 0:
+            return cand
+    path = _writable_model_dir() / file
+    path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[vcam] Downloading {label} model -> {path} ...")
     try:
         urllib.request.urlretrieve(url, path)
@@ -444,6 +460,8 @@ class MediaPipeEngine:
     """
 
     def __init__(self, width, height, args):
+        if mp is None:
+            raise RuntimeError("MediaPipe engine is not available in this build; use the RVM engine.")
         self.segmenter = make_segmenter(ensure_model(args.model))
         self.refiner = MaskRefiner(
             width, height,
@@ -513,8 +531,12 @@ def make_engine(args, width, height):
                       f"(downsample_ratio={engine.dsr:.2f}, threads={engine.threads})")
                 return engine
             except Exception as exc:  # noqa: BLE001
+                if mp is None:
+                    raise RuntimeError(f"RVM engine failed to start: {exc}") from exc
                 print(f"[vcam] RVM unavailable ({exc}) -> falling back to MediaPipe.")
                 want = "mediapipe"
+    if mp is None:
+        raise RuntimeError("No matting engine available (onnxruntime/RVM required).")
     print("[vcam] Engine: MediaPipe selfie segmentation")
     return MediaPipeEngine(width, height, args)
 

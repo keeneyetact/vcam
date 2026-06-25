@@ -1,6 +1,8 @@
-# vcam — real-time webcam background replacement
+# vcam — real-time webcam virtual background
 # Python 3.9–3.13.  Install with:  pip install -r requirements.txt
 mediapipe>=0.10.30
-opencv-python>=4.8
+# contrib build provides cv2.ximgproc (guided filter for sharp edge refinement);
+# it is also what mediapipe depends on. Do NOT also install opencv-python — they conflict.
+opencv-contrib-python>=4.8
 pyvirtualcam>=0.11
 numpy>=1.24

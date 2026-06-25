@@ -1,10 +1,13 @@
-# vcam — real-time webcam background replacement
+# vcam — real-time webcam virtual background
 
-Isolate yourself from your real background in real time using **Google
-MediaPipe Selfie Segmentation**, composite over a background image / blur /
-solid color, and expose the result as a **system virtual camera** (via
-`pyvirtualcam`) that any app — Zoom, Google Meet, Teams, Discord, OBS — can
+Replace your real background in real time using **Google MediaPipe Selfie
+Segmentation**, and expose the result as a **system virtual camera** (via
+`pyvirtualcam`) that any app — Google Meet, Zoom, Teams, Discord, OBS — can
 select like a normal webcam.
+
+Tuned to look real, not "virtual": it isolates a **single person** with a
+**sharp, edge-hugging cutout**, removes everything outside that edge (no halo),
+and stays flicker-free against a still background image.
 
 100% local. No cloud, no account, no subscription. The segmentation model is
 Google's free, open-source `selfie_segmenter` (`.tflite`), downloaded
@@ -36,20 +39,26 @@ install `v4l2loopback`.
 ## 2. Run
 
 ```bash
-# Blur your real background (default)
-python vcam.py
+# Virtual background from an image (the main use case)
+python vcam.py --background 2.png
 
-# Replace with an image
-python vcam.py --background backgrounds/beach.jpg
+# Blur your real background instead
+python vcam.py --blur
 
-# Solid green screen (chroma key), mirrored, second camera
-python vcam.py --color 0,177,64 --camera 1 --mirror
+# Solid green screen (chroma key)
+python vcam.py --color 0,177,64
 
 # Headless: no preview window, just feed the virtual cam
 python vcam.py --background office.png --no-preview
 ```
 
-Then, in your video app, pick **"OBS Virtual Camera"** as the webcam.
+### Use it in Google Meet
+
+1. Make sure **no other app is using the webcam** — a camera can only be owned
+   by one app at a time. (If vcam says it can't open the camera, that's why.)
+2. Run `python vcam.py --background 2.png` and leave it running.
+3. In Meet: **⋮ → Settings → Video → Camera → "OBS Virtual Camera"**.
+   (Meet uses the *virtual* camera; vcam owns the *physical* one.)
 
 Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 
@@ -60,7 +69,7 @@ Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--background, -b PATH` | — | Background image to composite behind you |
-| `--blur` | (default) | Blur the real background instead of replacing it |
+| `--blur` | — | Blur the real background instead of replacing it |
 | `--color R,G,B` | — | Solid color background, e.g. `0,177,64` |
 | `--camera, -c N` | `0` | Webcam device index (try 0, 1, 2…) |
 | `--width` / `--height` | `1280` / `720` | **Capture** resolution (what the camera delivers) |
@@ -68,7 +77,12 @@ Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 | `--fps` | `30` | Target frame rate |
 | `--model` | `general` | `general` (square) or `landscape` (wide, slightly faster) |
 | `--threshold` | `0.5` | Mask cutoff 0–1; lower keeps more of you |
-| `--feather` | `3` | Edge-softening radius in px (`0` = hard edge) |
+| `--feather` | `1` | Edge anti-alias radius in px (`0` = hardest edge) |
+| `--edge-radius` | `12` | Edge-refinement strength (guided filter). Higher hugs broad edges; lower keeps fine detail |
+| `--erode` | `1` | Shrink the cutout by N px to kill the background halo (`0` = none) |
+| `--temporal` | `0.5` | Temporal smoothing 0–1 (weight of current frame). Lower = steadier; `1` = off |
+| `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
+| `--mask-scale` | `1.0` | Resolution scale for edge refinement (`0.5` = faster, slightly softer) |
 | `--mirror` | off | Horizontally flip (selfie view) |
 | `--no-preview` | off | Don't open the preview window |
 | `--no-virtualcam` | off | Preview only; don't open a virtual camera |
@@ -78,17 +92,34 @@ Quit with **q** / **Esc** in the preview window, or **Ctrl+C** in the terminal.
 ## 4. How it works
 
 ```
-webcam ──► OpenCV capture ──► MediaPipe ImageSegmenter ──► soft person mask
+webcam ─► OpenCV capture ─► MediaPipe ImageSegmenter ─► raw confidence mask
                                                               │
-                 background (image / blur / color) ───────────┤
+        guided filter (snap to real edges) ◄──────────────────┤
+        motion-adaptive temporal smoothing (no flicker/ghost)  │
+        threshold ─► keep largest blob (ONE person)            │
+        fill holes ─► erode 1px (no halo) ─► 1px feather        ▼
+                                              sharp alpha matte
+                                                              │
+                 background image / blur / color ─────────────┤
                                                               ▼
-                                       alpha composite ──► pyvirtualcam ──► system camera
+                                  alpha composite ─► pyvirtualcam ─► system camera
 ```
+
+The **mask pipeline** is what makes the cutout look real rather than virtual:
+
+- **Guided filter** (`cv2.ximgproc.guidedFilter`) snaps the fuzzy model mask onto
+  the actual image edges — hair, shoulders, headphones — so the cut hugs the guy.
+- **Largest connected component** keeps exactly one person; any other object or
+  person in frame is dropped (`--multi-person` to keep all).
+- **Erode + threshold** remove everything outside the edge completely (no halo).
+- **Motion-adaptive temporal smoothing** kills flicker against a still background
+  where you're steady, but follows you where you move — so there are no ghost trails.
 
 The script uses MediaPipe's **Tasks API** (`ImageSegmenter`, VIDEO mode). The
 older `mp.solutions.selfie_segmentation` API was removed in MediaPipe 0.10.30+;
 this project uses the current model file (`models/selfie_segmenter.tflite`),
-fetched automatically.
+fetched automatically. Edge refinement needs `opencv-contrib-python` (for
+`cv2.ximgproc`); without it edges fall back to softer feathering.
 
 ---
 
@@ -125,11 +156,18 @@ frame rate automatically — add light before blaming the code.
 
 ## 6. Troubleshooting
 
+- **"Could not open camera"** → another app owns the webcam (Meet/Zoom/Teams/OBS
+  or another script). Close it, or use a different `--camera` index.
 - **"could not start a virtual camera"** → install OBS Studio (see step 1) so a
   virtual-camera driver exists, then re-run.
-- **Wrong / black camera** → change `--camera` index.
-- **Jagged edges** → raise `--feather` (e.g. `5`) or lower `--threshold`.
-- **Too much of you cut off** → lower `--threshold` (e.g. `0.3`).
-- **Low FPS** → see [Performance](#5-performance). Short version: lower the
-  **capture** resolution (e.g. `--width 640 --height 480`) and add `--out-width
-  1280 --out-height 720` to keep a 720p stream; add light; try `--no-preview`.
+- **Halo / background bleeding around you** → raise `--erode` (e.g. `2`).
+- **Edge too soft / not crisp** → lower `--feather` to `0`, and/or lower
+  `--edge-radius` (e.g. `8`) to keep fine detail.
+- **Bits of you get cut off** → lower `--threshold` (e.g. `0.4`).
+- **A second person/object shows up** → that shouldn't happen (only the largest
+  person is kept); pass `--multi-person` if you actually want to keep everyone.
+- **Flicker against the background** → lower `--temporal` (e.g. `0.3`).
+- **Ghost trail when you move fast** → raise `--temporal` toward `1` (less smoothing).
+- **Low FPS** → see [Performance](#5-performance). Lower the **capture** resolution
+  (e.g. `--width 640 --height 480`, add `--out-width 1280 --out-height 720` for a
+  720p stream), use `--mask-scale 0.5`, add light, or try `--no-preview`.

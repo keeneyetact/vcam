@@ -156,8 +156,9 @@ def open_camera(index: int, width: int, height: int, fps: int) -> cv2.VideoCaptu
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low: always the freshest frame
     if not cap.isOpened():
         sys.exit(
-            f"Could not open camera index {index}. "
-            "Try a different --camera index (0, 1, 2, ...)."
+            f"Could not open camera index {index}. A webcam can only be used by one app "
+            "at a time; close anything else holding it (Zoom/Meet/Teams/OBS, or another "
+            "script), or try a different --camera index (0, 1, 2, ...)."
         )
     return cap
 
@@ -204,8 +205,108 @@ class FrameGrabber:
         self._thread.join(timeout=1.0)
 
 
+_HAS_XIMGPROC = hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
+
+
+class MaskRefiner:
+    """Turns MediaPipe's soft confidence mask into a clean, sharp, single-person
+    alpha matte — the difference between an obvious "cut-out" and a background
+    that doesn't look virtual.
+
+    Pipeline (raw confidence mask -> final alpha):
+      1. guided filter — snaps the fuzzy mask boundary onto the real image edges
+         (hair, shoulders) using the camera frame as the guide. This is what
+         makes the cut "hug the guy".
+      2. temporal EMA on the continuous mask — kills frame-to-frame flicker
+         (very visible against a still background) WITHOUT softening the final
+         edge, because we smooth before thresholding.
+      3. threshold -> hard binary.
+      4. keep only the largest connected component => exactly ONE person; every
+         other blob/object is dropped.
+      5. close internal holes, then erode 1 px so no rim of the original
+         background bleeds through (removes the halo "outside the edge").
+      6. a 1 px feather just to anti-alias the otherwise hard edge.
+    """
+
+    def __init__(self, width, height, *, threshold=0.5, feather=1, erode=1,
+                 radius=12, eps=1e-4, temporal=0.5, single_person=True, scale=1.0):
+        self.w, self.h = width, height
+        self.threshold = float(threshold)
+        self.feather = int(feather)
+        self.erode = int(erode)
+        self.eps = float(eps)
+        self.temporal = float(temporal)          # weight of the current frame; 1.0 disables EMA
+        self.single = bool(single_person)
+        self.scale = float(scale)
+        self.sw = max(64, int(round(width * self.scale)))
+        self.sh = max(64, int(round(height * self.scale)))
+        self.radius = max(1, int(round(radius * self.scale)))
+        self._prev = None                        # previous continuous mask (working res)
+        self._close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        if not _HAS_XIMGPROC:
+            print("[vcam] NOTE: cv2.ximgproc unavailable; edges will be softer. "
+                  "Install opencv-contrib-python for sharp edge refinement.")
+
+    def refine(self, frame_bgr, raw_mask):
+        """Return a float32 alpha matte in [0, 1] at full (w, h)."""
+        mask = np.ascontiguousarray(raw_mask, dtype=np.float32)
+
+        # --- work at `scale` resolution for speed ---
+        if (self.sw, self.sh) != (self.w, self.h):
+            guide = cv2.resize(frame_bgr, (self.sw, self.sh), interpolation=cv2.INTER_AREA)
+            mask = cv2.resize(mask, (self.sw, self.sh), interpolation=cv2.INTER_LINEAR)
+        else:
+            guide = frame_bgr
+        guide_gray = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+        # 1. edge-aware refinement: pull the boundary onto real image edges.
+        if _HAS_XIMGPROC:
+            mask = cv2.ximgproc.guidedFilter(guide_gray, mask, self.radius, self.eps)
+
+        # 2. temporal stabilization on the continuous mask (before thresholding).
+        #    Motion-adaptive: where the mask is stable we smooth hard (kills the
+        #    flicker that screams "virtual"); where it's moving we follow the
+        #    current frame so there are no ghost trails behind a moving head.
+        if self.temporal < 1.0 and self._prev is not None and self._prev.shape == mask.shape:
+            motion = cv2.absdiff(mask, self._prev)
+            w = self.temporal + (1.0 - self.temporal) * np.minimum(motion * 4.0, 1.0)
+            mask = w * mask + (1.0 - w) * self._prev
+        self._prev = mask
+
+        # 3. hard threshold.
+        binary = (mask > self.threshold).astype(np.uint8)
+
+        # 4. keep only the largest blob => one person.
+        if self.single:
+            binary = self._largest_component(binary)
+
+        # 5. fill internal holes, then pull the edge in to kill the background halo.
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self._close_k)
+        if self.erode > 0:
+            ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.erode * 2 + 1,) * 2)
+            binary = cv2.erode(binary, ek)
+
+        # back to full resolution.
+        alpha = cv2.resize(binary * 255, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+
+        # 6. thin feather just to anti-alias the hard edge.
+        if self.feather > 0:
+            k = self.feather * 2 + 1
+            alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+
+        return alpha.astype(np.float32) / 255.0
+
+    @staticmethod
+    def _largest_component(binary):
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if n <= 1:
+            return binary                         # nothing detected; leave as-is
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        return (labels == biggest).astype(np.uint8)
+
+
 class Compositor:
-    """Alpha-blends the person over a background using the soft mask.
+    """Alpha-blends the person over a background using a precomputed alpha matte.
 
     Optimised hot path (~8 ms/frame at 720p vs ~19 ms for the naive float
     version):
@@ -216,12 +317,10 @@ class Compositor:
     blur is low-frequency so the result is visually identical.
     """
 
-    def __init__(self, width, height, background_bgr, blur_bg, threshold, feather):
+    def __init__(self, width, height, background_bgr, blur_bg):
         self.w, self.h = width, height
         self.background = background_bgr        # None in blur mode
         self.blur_bg = blur_bg
-        self.threshold = threshold
-        self.feather = feather
         # Reused scratch buffers (allocated once).
         self._diff = np.empty((height, width, 3), np.int16)
         self._out = np.empty((height, width, 3), np.uint8)
@@ -234,16 +333,10 @@ class Compositor:
         cv2.GaussianBlur(small, (0, 0), sigmaX=4, sigmaY=4, dst=small)
         return cv2.resize(small, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
 
-    def render(self, frame_bgr, mask):
-        """`mask` is HxW float32 in [0, 1]; 1 == person, 0 == background."""
+    def render(self, frame_bgr, alpha):
+        """`alpha` is a HxW float32 matte in [0, 1]; 1 == person, 0 == background."""
         bg = self._blurred_background(frame_bgr) if self.blur_bg else self.background
 
-        if self.feather > 0:
-            k = self.feather * 2 + 1
-            mask = cv2.GaussianBlur(mask, (k, k), 0)
-
-        # Bias toward foreground around the threshold, then to a uint8 alpha 0-255.
-        alpha = np.clip((mask - self.threshold) * 3.0 + 0.5, 0.0, 1.0)
         alpha_u8 = (alpha * 255.0).astype(np.uint8)
         alpha3 = cv2.merge([alpha_u8, alpha_u8, alpha_u8])
 
@@ -287,7 +380,13 @@ def run(args: argparse.Namespace) -> int:
         blur_bg = True  # sensible default: blur the real background
         print("[vcam] No background specified -> blurring the real background.")
 
-    compositor = Compositor(width, height, background_bgr, blur_bg, args.threshold, args.feather)
+    refiner = MaskRefiner(
+        width, height,
+        threshold=args.threshold, feather=args.feather, erode=args.erode,
+        radius=args.edge_radius, temporal=args.temporal,
+        single_person=not args.multi_person, scale=args.mask_scale,
+    )
+    compositor = Compositor(width, height, background_bgr, blur_bg)
 
     # Try to open the virtual camera; degrade gracefully to preview-only.
     cam = None
@@ -338,7 +437,8 @@ def run(args: argparse.Namespace) -> int:
             if mask.ndim == 3:
                 mask = mask[:, :, 0]
 
-            out_bgr = compositor.render(frame_bgr, mask)
+            alpha = refiner.refine(frame_bgr, mask)          # sharp, single-person matte
+            out_bgr = compositor.render(frame_bgr, alpha)
 
             if upscaling:
                 out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
@@ -391,7 +491,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", choices=("general", "landscape"), default="general",
                    help="MediaPipe model: 'general' (square) or 'landscape' (wide, slightly faster)")
     p.add_argument("--threshold", type=float, default=0.5, help="mask cutoff (0-1); lower keeps more of you")
-    p.add_argument("--feather", type=int, default=3, help="edge softening radius in px (0 = hard edge)")
+    p.add_argument("--feather", type=int, default=1, help="edge anti-alias radius in px (0 = hardest edge)")
+    p.add_argument("--edge-radius", type=int, default=12,
+                   help="edge-refinement strength (guided filter); higher hugs broad edges, lower keeps fine detail")
+    p.add_argument("--erode", type=int, default=1,
+                   help="shrink the cutout by N px to remove the background halo (0 = none)")
+    p.add_argument("--temporal", type=float, default=0.5,
+                   help="temporal smoothing 0-1 (weight of current frame); lower = steadier, 1 = off")
+    p.add_argument("--multi-person", action="store_true",
+                   help="keep everyone in frame (default: keep only the single largest person)")
+    p.add_argument("--mask-scale", type=float, default=1.0,
+                   help="resolution scale for edge refinement (e.g. 0.5 = faster, slightly softer)")
     p.add_argument("--mirror", action="store_true", help="horizontally flip (selfie view)")
     p.add_argument("--no-preview", action="store_true", help="don't open the OpenCV preview window")
     p.add_argument("--no-virtualcam", action="store_true", help="preview only; don't open a virtual camera")

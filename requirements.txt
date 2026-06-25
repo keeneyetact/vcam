@@ -1,0 +1,6 @@
+# vcam — real-time webcam background replacement
+# Python 3.9–3.13.  Install with:  pip install -r requirements.txt
+mediapipe>=0.10.30
+opencv-python>=4.8
+pyvirtualcam>=0.11
+numpy>=1.24

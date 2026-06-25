@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Downloaded model weights (fetched automatically on first run)
+models/*.tflite
+
+# Local backgrounds / scratch
+backgrounds/*.local.*
+*.log

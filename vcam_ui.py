@@ -37,9 +37,12 @@ PREVIEW_W = 480
 
 # label -> (capture_w, capture_h, out_w, out_h). "Smooth" captures at a fast
 # low-res the webcam can deliver at 30 fps, then upscales the matted output.
+# The capture size is 16:9 (matches the 1280x720 output) so the upscale is
+# uniform — a 4:3 capture would stretch you horizontally — and 360p mattes
+# ~20% faster than 480p (fewer pixels through the net).
 SPEED_MODES = {
     "Sharp (720p, ~camera fps)": (1280, 720, None, None),
-    "Smooth (30 fps, upscaled)": (640, 480, 1280, 720),
+    "Smooth (30 fps, upscaled)": (640, 360, 1280, 720),
 }
 SPEED_DEFAULT = "Sharp (720p, ~camera fps)"
 

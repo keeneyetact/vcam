@@ -402,15 +402,18 @@ class RvmEngine:
     def __init__(self, width, height, *, downsample=None, single_person=True, threads=None):
         if ort is None:
             raise RuntimeError("onnxruntime is not installed (pip install onnxruntime)")
-        so = ort.SessionOptions()
         # More threads than physical cores hurts this small recurrent net (on a
-        # 14700 all-28-logical = 77 ms vs 8 = 48 ms), so cap it.
-        so.intra_op_num_threads = int(threads) if threads else _rvm_thread_count()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.threads = so.intra_op_num_threads
-        self.sess = ort.InferenceSession(
-            str(ensure_rvm_model()), so, providers=["CPUExecutionProvider"]
-        )
+        # 14700 all-28-logical = 77 ms vs 8 = 48 ms), so cap it. (Only the CPU
+        # provider uses these; a GPU provider ignores them.)
+        self.threads = int(threads) if threads else _rvm_thread_count()
+        # Pick the fastest WORKING execution provider. A GPU (DirectML/CUDA/...)
+        # can be several times faster than the CPU — but only a capable one: an
+        # integrated or old GPU is often *slower* than a many-core CPU for this
+        # small net, and some GPU providers build a session fine yet fail at run
+        # time. So we verify and time-trial the GPU and only keep it when it
+        # clearly beats the CPU; otherwise we stay on the (reliable) CPU.
+        self.sess, self.provider, self.bench = _select_rvm_session(
+            ensure_rvm_model(), self.threads, width, height)
         self.w, self.h = width, height
         self.single = bool(single_person)
         # downsample_ratio drives the coarse network's resolution and dominates
@@ -427,13 +430,14 @@ class RvmEngine:
 
     def process(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)             # HWC uint8
         # Fill a reused float32 NCHW buffer directly (avoids astype + transpose
-        # + ascontiguousarray copies: ~7.5 ms -> ~2 ms at 720p).
+        # + ascontiguousarray copies: ~7.5 ms -> ~2 ms at 720p). RVM expects
+        # normalised RGB, so index the BGR frame's channels in RGB order
+        # (R=2, G=1, B=0) — this also skips an intermediate cvtColor copy.
         if self._src is None or self._src.shape[2:] != (h, w):
             self._src = np.empty((1, 3, h, w), np.float32)
         src = self._src
-        src[0, 0], src[0, 1], src[0, 2] = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        src[0, 0], src[0, 1], src[0, 2] = frame_bgr[:, :, 2], frame_bgr[:, :, 1], frame_bgr[:, :, 0]
         np.multiply(src, np.float32(1.0 / 255.0), out=src)
         fgr, pha, *self._rec = self.sess.run(
             [], {"src": src, "r1i": self._rec[0], "r2i": self._rec[1],
@@ -493,6 +497,78 @@ def _rvm_thread_count() -> int:
     return max(2, min(8, os.cpu_count() or 4))
 
 
+def _rvm_providers() -> list[str]:
+    """onnxruntime execution providers for RVM, fastest-available first with a
+    guaranteed CPU fallback. A plain ``pip install onnxruntime`` ships CPU only;
+    installing ``onnxruntime-directml`` (Windows GPU, incl. Intel/AMD iGPUs) or
+    ``onnxruntime-gpu`` (NVIDIA CUDA) lights up the GPU and makes matting several
+    times faster. Unavailable providers are filtered out, so this is always safe."""
+    if ort is None:
+        return ["CPUExecutionProvider"]
+    available = set(ort.get_available_providers())
+    preferred = ["DmlExecutionProvider", "CUDAExecutionProvider",
+                 "ROCMExecutionProvider", "CoreMLExecutionProvider"]
+    return [p for p in preferred if p in available] + ["CPUExecutionProvider"]
+
+
+def _build_rvm_session(model_path, providers, threads, *, quiet=False):
+    """Build an RVM InferenceSession on `providers` (fastest first, CPU last)."""
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = threads
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if any(p != "CPUExecutionProvider" for p in providers):
+        so.enable_mem_pattern = False          # required by the DirectML provider
+    if quiet:
+        so.log_severity_level = 4              # hush probe-time errors from a bad GPU
+    return ort.InferenceSession(str(model_path), so, providers=providers)
+
+
+def _bench_rvm_session(sess, width, height, n=6) -> float:
+    """Median ms/frame over a few dummy inferences. Raises if the provider builds
+    a session but can't actually run the model (e.g. some integrated/old GPUs)."""
+    src = np.zeros((1, 3, height, width), np.float32)
+    rec = [np.zeros([1, 1, 1, 1], np.float32) for _ in range(4)]
+    dsr = np.array([0.375], np.float32)
+
+    def one():
+        nonlocal rec
+        t = time.perf_counter()
+        _, _, *rec = sess.run([], {"src": src, "r1i": rec[0], "r2i": rec[1],
+                                   "r3i": rec[2], "r4i": rec[3], "downsample_ratio": dsr})
+        return (time.perf_counter() - t) * 1000.0
+
+    one(); one()                               # warm up (shader compile / arena alloc)
+    times = sorted(one() for _ in range(n))
+    return times[len(times) // 2]
+
+
+def _select_rvm_session(model_path, threads, width, height):
+    """Return (session, provider_name, bench) on the fastest working provider.
+
+    Always falls back to the CPU, which is reliable and — for this small net on a
+    modern many-core CPU — frequently faster than an integrated/old GPU. A GPU is
+    only adopted when it both runs the model *and* clearly beats the CPU.
+    `bench` is None when no GPU was tried, else (cpu_ms, gpu_ms, gpu_name)."""
+    cpu_sess = _build_rvm_session(model_path, ["CPUExecutionProvider"], threads)
+    gpus = [p for p in _rvm_providers() if p != "CPUExecutionProvider"]
+    if not gpus:
+        return cpu_sess, "CPUExecutionProvider", None
+    cpu_ms = _bench_rvm_session(cpu_sess, width, height)
+    for prov in gpus:
+        try:
+            gpu_sess = _build_rvm_session(model_path, [prov, "CPUExecutionProvider"],
+                                          threads, quiet=True)
+            if gpu_sess.get_providers()[0] != prov:
+                continue                       # provider silently declined the model
+            gpu_ms = _bench_rvm_session(gpu_sess, width, height)
+        except Exception:                      # builds but can't run -> ignore this GPU
+            continue
+        if gpu_ms < cpu_ms * 0.9:              # only switch if clearly (>10%) faster
+            return gpu_sess, prov, (cpu_ms, gpu_ms, prov)
+        return cpu_sess, "CPUExecutionProvider", (cpu_ms, gpu_ms, prov)
+    return cpu_sess, "CPUExecutionProvider", None
+
+
 def _keep_largest(alpha):
     """Keep only the single largest person blob in a soft alpha matte; suppress
     the rest while preserving the kept subject's soft edges. Connected components
@@ -527,8 +603,19 @@ def make_engine(args, width, height):
                                    downsample=args.downsample,
                                    single_person=not args.multi_person,
                                    threads=getattr(args, "threads", None))
+                on_cpu = engine.provider == "CPUExecutionProvider"
+                accel = f"CPU x{engine.threads} threads" if on_cpu else engine.provider
                 print(f"[vcam] Engine: RobustVideoMatting "
-                      f"(downsample_ratio={engine.dsr:.2f}, threads={engine.threads})")
+                      f"(downsample_ratio={engine.dsr:.2f}, {accel})")
+                if engine.bench:               # a GPU was time-trialled
+                    cpu_ms, gpu_ms, gpu = engine.bench
+                    print(f"[vcam] Provider trial: CPU {cpu_ms:.0f} ms/frame vs "
+                          f"{gpu} {gpu_ms:.0f} ms/frame -> using "
+                          f"{'GPU' if not on_cpu else 'CPU (faster here)'}.")
+                elif on_cpu:
+                    print("[vcam] Running on CPU. If you have a powerful (discrete) "
+                          "GPU, installing onnxruntime-directml (Windows) or "
+                          "onnxruntime-gpu (NVIDIA/CUDA) can speed matting up.")
                 return engine
             except Exception as exc:  # noqa: BLE001
                 if mp is None:

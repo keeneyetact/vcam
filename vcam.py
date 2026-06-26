@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -700,6 +701,75 @@ def uninstall_virtualcam() -> tuple[bool, str]:
     return _run_regsvr(find_virtualcam_dlls(), unregister=True)
 
 
+class OutputPipeline:
+    """Runs compositing + virtual-cam send on a worker thread so that work
+    overlaps the *next* frame's inference instead of waiting behind it.
+
+    The matte (engine.process) is a serial ~58 ms wall — each frame feeds the
+    recurrent state into the next, so inferences can't overlap each other. But
+    the ~10-15 ms of compositing + cam.send AFTER inference don't depend on the
+    next frame, so doing them on a second thread hides them behind the next
+    inference. Frames are handled in submit order and the output is byte-for-byte
+    identical to doing it inline — a pure throughput win (~10-15% in Sharp mode),
+    costing one extra frame of latency (imperceptible for a webcam).
+    """
+
+    def __init__(self, cam, on_output=None):
+        self._cam = cam
+        self._on_output = on_output          # optional callback(out_bgr)
+        self._q = queue.Queue(maxsize=2)     # small => bounded latency + back-pressure
+        self._latest = None
+        self._lock = threading.Lock()
+        self.error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, compositor, source_bgr, alpha, upscale=None):
+        """Hand one frame's render+send to the worker. Blocks (back-pressure) if
+        the worker is two frames behind; raises if the worker has failed."""
+        if self.error is not None:
+            raise self.error
+        self._q.put((compositor, source_bgr, alpha, upscale))
+
+    def latest(self):
+        """Most recently sent output frame (for preview); None until the first."""
+        with self._lock:
+            return self._latest
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            if self.error is not None:
+                continue                     # drain quietly so submit() never blocks
+            try:
+                compositor, source_bgr, alpha, upscale = item
+                out = compositor.render(source_bgr, alpha)
+                if upscale is not None and (out.shape[1], out.shape[0]) != upscale:
+                    out = cv2.resize(out, upscale, interpolation=cv2.INTER_LINEAR)
+                if self._cam is not None:
+                    self._cam.send(out)
+                    self._cam.sleep_until_next_frame()
+                with self._lock:
+                    self._latest = out
+                if self._on_output is not None:
+                    self._on_output(out)
+            except Exception as exc:  # noqa: BLE001  (surfaced to producer via submit)
+                self.error = exc
+
+    def close(self):
+        try:
+            self._q.put(None, timeout=1.0)
+        except queue.Full:                   # worker wedged; drop a slot and signal
+            try:
+                self._q.get_nowait()
+                self._q.put_nowait(None)
+            except (queue.Empty, queue.Full):
+                pass
+        self._thread.join(timeout=2.0)
+
+
 # --------------------------------------------------------------------------- #
 # Worker — runs the capture→matte→composite→virtual-cam loop in a thread so a
 # GUI can start/stop it and swap the background live.
@@ -770,8 +840,12 @@ class VCamWorker:
                 pass   # unreadable image -> fall back to blur
         return Compositor(width, height, None, True)   # blur (and fallback when no image chosen)
 
+    def _store_latest(self, out):
+        with self._lock:
+            self._latest = out
+
     def _loop(self):
-        cap = cam = grabber = engine = None
+        cap = cam = grabber = engine = pipeline = None
         try:
             with self._lock:
                 cfg = dict(self.cfg)
@@ -788,14 +862,19 @@ class VCamWorker:
             # small/fast frame, upscale the finished frame -> smooth 30 fps.
             out_w = cfg["out_width"] or width
             out_h = cfg["out_height"] or height
-            upscaling = (out_w, out_h) != (width, height)
+            upscale = (out_w, out_h) if (out_w, out_h) != (width, height) else None
             cam = pyvirtualcam.Camera(width=out_w, height=out_h, fps=cfg["fps"], fmt=PixelFormat.BGR)
             self.device = cam.device
+            # Compositing + cam.send run on a worker thread, overlapping the next
+            # frame's inference (identical output, higher fps).
+            pipeline = OutputPipeline(cam, on_output=self._store_latest)
             grabber = FrameGrabber(cap).start()
             self.running = True
             self.status = "running"
             frames, t0, last_seq = 0, time.time(), -1
             while not self._stop.is_set():
+                if pipeline.error is not None:
+                    raise pipeline.error
                 seq, frame = grabber.read()
                 if frame is None:
                     if not grabber.running:
@@ -814,13 +893,7 @@ class VCamWorker:
                 if mirror:
                     frame = cv2.flip(frame, 1)
                 alpha, fg = engine.process(frame)
-                out = compositor.render(fg if fg is not None else frame, alpha)
-                if upscaling:
-                    out = cv2.resize(out, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-                cam.send(out)
-                cam.sleep_until_next_frame()
-                with self._lock:
-                    self._latest = out
+                pipeline.submit(compositor, fg if fg is not None else frame, alpha, upscale)
                 frames += 1
                 if frames % 15 == 0:
                     self.fps = frames / (time.time() - t0)
@@ -830,6 +903,8 @@ class VCamWorker:
         finally:
             if grabber:
                 grabber.stop()
+            if pipeline:
+                pipeline.close()         # drain + join worker before closing the cam
             if cap:
                 cap.release()
             if engine:
@@ -892,12 +967,19 @@ def run(args: argparse.Namespace) -> int:
         print("[vcam] pyvirtualcam not installed -> preview-only mode.")
 
     grabber = FrameGrabber(cap).start()
+    # Compositing + cam.send run on a worker thread so they overlap the next
+    # frame's inference (identical output, higher fps). The preview window stays
+    # on this (main) thread and shows the worker's latest finished frame.
+    upscale = (out_w, out_h) if upscaling else None
+    pipeline = OutputPipeline(cam)
 
     show_preview = not args.no_preview
     frames, t0 = 0, time.time()
     last_seq = -1
     try:
         while True:
+            if pipeline.error is not None:
+                raise pipeline.error
             seq, frame_bgr = grabber.read()
             if frame_bgr is None:
                 if not grabber.running:
@@ -915,17 +997,13 @@ def run(args: argparse.Namespace) -> int:
 
             alpha, foreground = engine.process(frame_bgr)
             # RVM returns a colour-decontaminated foreground; otherwise use the frame.
-            out_bgr = compositor.render(foreground if foreground is not None else frame_bgr, alpha)
-
-            if upscaling:
-                out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-            if cam is not None:
-                cam.send(out_bgr)
-                cam.sleep_until_next_frame()
+            pipeline.submit(compositor, foreground if foreground is not None else frame_bgr,
+                            alpha, upscale)
 
             if show_preview:
-                cv2.imshow("vcam preview (q/Esc to quit)", out_bgr)
+                preview = pipeline.latest()
+                if preview is not None:
+                    cv2.imshow("vcam preview (q/Esc to quit)", preview)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):  # q or Esc
                     break
@@ -938,6 +1016,7 @@ def run(args: argparse.Namespace) -> int:
         print("\n[vcam] Interrupted.")
     finally:
         grabber.stop()
+        pipeline.close()         # drain + join worker before closing the cam
         cap.release()
         engine.close()
         if cam is not None:

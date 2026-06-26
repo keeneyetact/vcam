@@ -455,6 +455,23 @@ class RvmEngine:
                             cv2.convertScaleAbs(fg[0], alpha=255.0)])
         return alpha, fg_bgr
 
+    def set_downsample(self, dsr):
+        """Live-tune the quality/speed dial. downsample_ratio is a per-frame model
+        input, so the change takes effect on the next frame with no session
+        rebuild. The recurrent state is sized to the *old* coarse resolution, so
+        it must be reset — otherwise the next inference fails on a shape mismatch
+        (one frame re-initialises temporal coherence; imperceptible)."""
+        dsr = float(dsr)
+        if abs(dsr - self.dsr) < 1e-6:
+            return
+        self.dsr = dsr
+        self._dsr = np.array([dsr], np.float32)
+        self._rec = [np.zeros([1, 1, 1, 1], np.float32) for _ in range(4)]
+
+    def set_single_person(self, single):
+        """Live toggle for keeping only the single largest person."""
+        self.single = bool(single)
+
     def close(self):
         pass
 
@@ -486,6 +503,10 @@ class MediaPipeEngine:
         if mask.ndim == 3:
             mask = mask[:, :, 0]
         return self.refiner.refine(frame_bgr, mask), None       # no foreground decontamination
+
+    def set_single_person(self, single):
+        """Live toggle for keeping only the single largest person."""
+        self.refiner.single = bool(single)
 
     def close(self):
         self.segmenter.close()
@@ -783,9 +804,17 @@ class VCamWorker:
         temporal=0.5, mask_scale=1.0,
     )
 
+    # Params that need the capture/engine/virtual-cam pipeline rebuilt (vs applied
+    # in-place each frame). Changing one while running triggers a quick automatic
+    # reconnect; everything else (mirror, downsample, one-person, background)
+    # applies live on the next frame with no rebuild.
+    _RESTART_KEYS = frozenset({"camera", "width", "height", "out_width",
+                               "out_height", "engine", "fps", "threads"})
+
     def __init__(self):
         self._thread = None
         self._stop = threading.Event()
+        self._restart = threading.Event()
         self._lock = threading.Lock()
         self._latest = None          # latest processed BGR frame (for preview)
         self._bg_dirty = False
@@ -799,7 +828,12 @@ class VCamWorker:
     # ---- public, thread-safe ----
     def configure(self, **kw):
         with self._lock:
+            restart = any(k in self._RESTART_KEYS and self.cfg.get(k) != v
+                          for k, v in kw.items())
             self.cfg.update(kw)
+        # A pipeline-shape change while live -> reconnect (no manual OFF/ON).
+        if restart and self.running:
+            self._restart.set()
 
     def set_background(self, mode, path=None, color=None):
         with self._lock:
@@ -809,6 +843,12 @@ class VCamWorker:
             if color is not None:
                 self.cfg["color"] = color
             self._bg_dirty = True
+
+    def set_quality(self, downsample):
+        """Live quality/speed balance (RVM downsample_ratio). Takes effect on the
+        next frame while running; also remembered for the next start."""
+        with self._lock:
+            self.cfg["downsample"] = downsample
 
     def latest_frame(self):
         with self._lock:
@@ -845,6 +885,26 @@ class VCamWorker:
             self._latest = out
 
     def _loop(self):
+        # Outer loop: a session runs until stop or until a pipeline-shape change
+        # (camera/resolution/engine) requests a reconnect, then rebuilds — so the
+        # user can change any option without clicking OFF/ON.
+        try:
+            while not self._stop.is_set():
+                self._restart.clear()
+                self.status = "starting"
+                self._run_session()
+        except Exception as exc:  # noqa: BLE001
+            self.error = str(exc)
+            self.status = "error"
+        finally:
+            self.running = False
+            self.device = None
+            with self._lock:
+                self._latest = None
+            if self.status != "error":
+                self.status = "stopped"
+
+    def _run_session(self):
         cap = cam = grabber = engine = pipeline = None
         try:
             with self._lock:
@@ -872,7 +932,7 @@ class VCamWorker:
             self.running = True
             self.status = "running"
             frames, t0, last_seq = 0, time.time(), -1
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._restart.is_set():
                 if pipeline.error is not None:
                     raise pipeline.error
                 seq, frame = grabber.read()
@@ -890,16 +950,20 @@ class VCamWorker:
                         compositor = self._build_compositor(width, height)
                         self._bg_dirty = False
                     mirror = self.cfg["mirror"]
+                    want_dsr = self.cfg.get("downsample")
+                    want_multi = self.cfg.get("multi_person")
                 if mirror:
                     frame = cv2.flip(frame, 1)
+                # Live, in-place option changes (no rebuild needed):
+                if want_dsr is not None and hasattr(engine, "set_downsample"):
+                    engine.set_downsample(want_dsr)          # RVM quality dial
+                if want_multi is not None and hasattr(engine, "set_single_person"):
+                    engine.set_single_person(not want_multi)  # only-one-person
                 alpha, fg = engine.process(frame)
                 pipeline.submit(compositor, fg if fg is not None else frame, alpha, upscale)
                 frames += 1
                 if frames % 15 == 0:
                     self.fps = frames / (time.time() - t0)
-        except Exception as exc:  # noqa: BLE001
-            self.error = str(exc)
-            self.status = "error"
         finally:
             if grabber:
                 grabber.stop()
@@ -911,11 +975,6 @@ class VCamWorker:
                 engine.close()
             if cam:
                 cam.close()
-            self.running = False
-            with self._lock:
-                self._latest = None
-            if self.status != "error":
-                self.status = "stopped"
 
 
 def run(args: argparse.Namespace) -> int:

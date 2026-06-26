@@ -46,6 +46,25 @@ SPEED_MODES = {
 }
 SPEED_DEFAULT = "Sharp (720p, ~camera fps)"
 
+# label -> RVM downsample_ratio (the quality<->speed dial; resolution unchanged).
+# Higher = sharper hair/edges but slower; lower = faster but softer. Applies live
+# while the camera is on (RVM engine only). 0.375 is RVM's recommended 720p point.
+# NOTE: above ~0.5 you leave RVM's trained coarse-resolution range, so the matte
+# barely gets sharper while speed craters (0.75 ≈ 6x slower for ~no visible gain).
+# The 0.60/0.75 rows are included so you can judge for yourself; 0.50 is the
+# practical sharpest.
+QUALITY_PRESETS = {
+    "Max sharp (0.75, very slow)": 0.75,
+    "Extra sharp (0.60, slow)": 0.60,
+    "Sharpest (0.50)": 0.50,
+    "Sharper (0.40)": 0.40,
+    "Balanced (0.375, default)": 0.375,
+    "Smoother (0.30)": 0.30,
+    "Fast (0.25)": 0.25,
+    "Fastest (0.20)": 0.20,
+}
+QUALITY_DEFAULT = "Balanced (0.375, default)"
+
 
 class VCamUI:
     def __init__(self, root: tk.Tk):
@@ -92,8 +111,11 @@ class VCamUI:
         self.run_status.grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(oc, text="Camera #").grid(row=1, column=0, sticky="e", **pad)
         self.cam_idx = tk.IntVar(value=0)
-        ttk.Spinbox(oc, from_=0, to=8, width=4, textvariable=self.cam_idx).grid(
-            row=1, column=1, sticky="w", **pad)
+        cam_spin = ttk.Spinbox(oc, from_=0, to=8, width=4, textvariable=self.cam_idx,
+                               command=self._apply_camera)
+        cam_spin.grid(row=1, column=1, sticky="w", **pad)
+        cam_spin.bind("<Return>", lambda _e: self._apply_camera())
+        cam_spin.bind("<FocusOut>", lambda _e: self._apply_camera())
 
         # Background
         bgf = ttk.LabelFrame(left, text="3. Background")
@@ -115,20 +137,33 @@ class VCamUI:
         op.grid(row=3, column=0, sticky="ew", **pad)
         ttk.Label(op, text="Speed").grid(row=0, column=0, sticky="e", **pad)
         self.quality = tk.StringVar(value=SPEED_DEFAULT)
-        ttk.Combobox(op, textvariable=self.quality, values=list(SPEED_MODES),
-                     width=20, state="readonly").grid(row=0, column=1, columnspan=2, sticky="w", **pad)
-        ttk.Label(op, text="Engine").grid(row=1, column=0, sticky="e", **pad)
+        speed_cb = ttk.Combobox(op, textvariable=self.quality, values=list(SPEED_MODES),
+                                width=20, state="readonly")
+        speed_cb.grid(row=0, column=1, columnspan=2, sticky="w", **pad)
+        speed_cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_speed())
+        ttk.Label(op, text="Quality").grid(row=1, column=0, sticky="e", **pad)
+        self.qbalance = tk.StringVar(value=QUALITY_DEFAULT)
+        qb = ttk.Combobox(op, textvariable=self.qbalance, values=list(QUALITY_PRESETS),
+                          width=20, state="readonly")
+        qb.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+        qb.bind("<<ComboboxSelected>>", lambda _e: self._apply_quality())
+        ttk.Label(op, text="Engine").grid(row=2, column=0, sticky="e", **pad)
         self.engine = tk.StringVar(value="auto")
-        ttk.Combobox(op, textvariable=self.engine, values=["auto", "rvm", "mediapipe"],
-                     width=10, state="readonly").grid(row=1, column=1, sticky="w", **pad)
+        eng_cb = ttk.Combobox(op, textvariable=self.engine, values=["auto", "rvm", "mediapipe"],
+                              width=10, state="readonly")
+        eng_cb.grid(row=2, column=1, sticky="w", **pad)
+        eng_cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_engine())
         self.mirror = tk.BooleanVar(value=False)
         ttk.Checkbutton(op, text="Mirror", variable=self.mirror,
-                        command=self._apply_opts).grid(row=1, column=2, sticky="w", **pad)
+                        command=self._apply_opts).grid(row=2, column=2, sticky="w", **pad)
         self.one_person = tk.BooleanVar(value=True)
-        ttk.Checkbutton(op, text="Only one person", variable=self.one_person).grid(
-            row=2, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Label(op, text="(speed/engine/camera/one-person apply on next ON)",
-                  foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(op, text="Only one person", variable=self.one_person,
+                        command=self._apply_oneperson).grid(
+            row=3, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(op, text="(All options apply live; changing Speed / Engine / Camera briefly "
+                           "reconnects the camera)",
+                  foreground="#888", wraplength=320, justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", **pad)
 
         # Right column: preview --------------------------------------------
         right = ttk.LabelFrame(self.root, text="Preview")
@@ -210,6 +245,7 @@ class VCamUI:
             camera=self.cam_idx.get(), engine=self.engine.get(), mode=mode,
             bg_path=self.bg_path, mirror=self.mirror.get(),
             multi_person=not self.one_person.get(),
+            downsample=QUALITY_PRESETS[self.qbalance.get()],
             width=cw, height=ch, out_width=ow, out_height=oh)
         self.toggle_btn.config(text="Turn OFF")
         self.worker.start()
@@ -223,6 +259,30 @@ class VCamUI:
 
     def _apply_opts(self):
         self.worker.configure(mirror=self.mirror.get())
+
+    def _apply_quality(self):
+        # Live quality<->speed balance (RVM only); takes effect on the next frame.
+        self.worker.set_quality(QUALITY_PRESETS[self.qbalance.get()])
+
+    def _apply_oneperson(self):
+        # Live (in-place): keep only the largest person, or everyone.
+        self.worker.configure(multi_person=not self.one_person.get())
+
+    def _apply_speed(self):
+        # Capture/output size change -> worker reconnects the camera automatically.
+        cw, ch, ow, oh = SPEED_MODES[self.quality.get()]
+        self.worker.configure(width=cw, height=ch, out_width=ow, out_height=oh)
+
+    def _apply_engine(self):
+        # Engine swap -> worker rebuilds the matting engine (auto reconnect).
+        self.worker.configure(engine=self.engine.get())
+
+    def _apply_camera(self):
+        # Camera index change -> worker reopens the device (auto reconnect).
+        try:
+            self.worker.configure(camera=int(self.cam_idx.get()))
+        except (tk.TclError, ValueError):
+            pass   # mid-typing / empty spinbox; ignore until a valid value
 
     def _choose_image(self) -> bool:
         path = filedialog.askopenfilename(

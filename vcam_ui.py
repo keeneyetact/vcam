@@ -65,6 +65,14 @@ QUALITY_PRESETS = {
 }
 QUALITY_DEFAULT = "Balanced (0.375, default)"
 
+# Blur sigma multiplier range for the "Blur balance" slider. Governs both the
+# live "Blur" background mode and the "Blur image" checkbox; 1.0 reproduces
+# the original fixed blur amount. Applies live (rebuilds the compositor, no
+# camera reconnect).
+BLUR_MIN = 0.1
+BLUR_MAX = 3.0
+BLUR_DEFAULT = 0.25
+
 
 class VCamUI:
     def __init__(self, root: tk.Tk):
@@ -131,6 +139,17 @@ class VCamUI:
             row=1, column=0, sticky="ew", **pad)
         self.img_label = ttk.Label(bgf, text=self._img_name(), foreground="#555")
         self.img_label.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+        self.blur_image = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bgf, text="Blur image (soft, out-of-focus background)",
+                        variable=self.blur_image, command=self._apply_bg).grid(
+            row=2, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(bgf, text="Blur balance").grid(row=3, column=0, sticky="e", **pad)
+        self.blur_strength = tk.DoubleVar(value=BLUR_DEFAULT)
+        blur_scale = ttk.Scale(bgf, from_=BLUR_MIN, to=BLUR_MAX, orient="horizontal",
+                               variable=self.blur_strength, command=self._on_blur_scale)
+        blur_scale.grid(row=3, column=1, sticky="ew", **pad)
+        self.blur_value_label = ttk.Label(bgf, text=f"{BLUR_DEFAULT:.2f}x", width=5)
+        self.blur_value_label.grid(row=3, column=2, sticky="w", **pad)
 
         # Options
         op = ttk.LabelFrame(left, text="4. Options")
@@ -243,8 +262,9 @@ class VCamUI:
         cw, ch, ow, oh = SPEED_MODES[self.quality.get()]
         self.worker.configure(
             camera=self.cam_idx.get(), engine=self.engine.get(), mode=mode,
-            bg_path=self.bg_path, mirror=self.mirror.get(),
-            multi_person=not self.one_person.get(),
+            bg_path=self.bg_path, blur_image=self.blur_image.get(),
+            blur_strength=self.blur_strength.get(),
+            mirror=self.mirror.get(), multi_person=not self.one_person.get(),
             downsample=QUALITY_PRESETS[self.qbalance.get()],
             width=cw, height=ch, out_width=ow, out_height=oh)
         self.toggle_btn.config(text="Turn OFF")
@@ -255,7 +275,14 @@ class VCamUI:
         if mode == "image" and not self.bg_path and not self._choose_image():
             self.mode.set("blur")
             mode = "blur"
-        self.worker.set_background(mode, path=self.bg_path)
+        self.worker.set_background(mode, path=self.bg_path, blur_image=self.blur_image.get())
+
+    def _on_blur_scale(self, value):
+        # Live: rebuilds the compositor with the new sigma (Blur mode and/or
+        # Blur image), no camera reconnect.
+        v = float(value)
+        self.blur_value_label.config(text=f"{v:.2f}x")
+        self.worker.set_blur_strength(v)
 
     def _apply_opts(self):
         self.worker.configure(mirror=self.mirror.get())
@@ -293,7 +320,7 @@ class VCamUI:
         self.bg_path = path
         self.img_label.config(text=self._img_name())
         self.mode.set("image")
-        self.worker.set_background("image", path=path)
+        self.worker.set_background("image", path=path, blur_image=self.blur_image.get())
         return True
 
     # ----------------------------------------------------------- main loop --

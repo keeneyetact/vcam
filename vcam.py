@@ -166,6 +166,23 @@ def load_background_image(path: str, width: int, height: int) -> np.ndarray:
     return resize_cover(img, width, height)
 
 
+def blur_background_image(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """Soft, out-of-focus version of a chosen background picture (the Meet-style
+    "blurred office photo" look, applied to your own image). Built once per
+    background choice rather than per frame, so unlike the live `--blur` mode
+    there's no speed budget: downscale->blur->upscale gives a smoother, more
+    photographic result than one big-sigma blur on the full-res image.
+
+    `strength` scales the blur sigma; 1.0 reproduces the original fixed amount.
+    """
+    h, w = img.shape[:2]
+    sw, sh = max(1, w // 8), max(1, h // 8)
+    small = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+    sigma = 6.0 * max(0.1, strength)
+    cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma, dst=small)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def solid_color_background(color_bgr: tuple[int, int, int], width: int, height: int) -> np.ndarray:
     bg = np.zeros((height, width, 3), dtype=np.uint8)
     bg[:] = color_bgr
@@ -357,29 +374,48 @@ class Compositor:
 
     `--blur` mode blurs a quarter-size copy and upscales it (~2.4 ms vs ~15 ms);
     blur is low-frequency so the result is visually identical.
+
+    The matte's edge also gets a light Gaussian feather (see `_feather_ksize`)
+    before blending. A hard edge is barely noticeable in blur mode -- a blurred
+    background hides it -- but against a sharp Image/Color background it reads
+    as an obvious "stencil" cutout. A few px of softening blends the person into
+    any background the way Google Meet's segmentation does, at negligible cost
+    (single-channel blur vs. the 3-channel ops below).
     """
 
-    def __init__(self, width, height, background_bgr, blur_bg):
+    def __init__(self, width, height, background_bgr, blur_bg, blur_strength=1.0):
         self.w, self.h = width, height
         self.background = background_bgr        # None in blur mode
         self.blur_bg = blur_bg
         # Reused scratch buffers (allocated once).
         self._diff = np.empty((height, width, 3), np.int16)
         self._out = np.empty((height, width, 3), np.uint8)
+        self._alpha_u8 = np.empty((height, width), np.uint8)
         # Downscaled blur working size (≥ 160x90).
         self._bw = max(160, width // 4)
         self._bh = max(90, height // 4)
+        # Blur intensity (--blur mode only); 1.0 reproduces the original fixed
+        # sigma. Exposed as the UI's "Blur strength" control.
+        self._blur_sigma = 4.0 * max(0.1, blur_strength)
+        # Edge-feather kernel, scaled to resolution (odd, ≥3): ~3px @360p,
+        # ~5px @720p. Gentle on purpose -- enough to kill the hard edge without
+        # softening hair/hand detail away.
+        radius = max(1, round(min(width, height) / 300))
+        k = radius * 2 + 1
+        self._feather_ksize = (k, k)
 
     def _blurred_background(self, frame_bgr):
         small = cv2.resize(frame_bgr, (self._bw, self._bh), interpolation=cv2.INTER_AREA)
-        cv2.GaussianBlur(small, (0, 0), sigmaX=4, sigmaY=4, dst=small)
+        cv2.GaussianBlur(small, (0, 0), sigmaX=self._blur_sigma, sigmaY=self._blur_sigma, dst=small)
         return cv2.resize(small, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
 
     def render(self, frame_bgr, alpha):
         """`alpha` is a HxW float32 matte in [0, 1]; 1 == person, 0 == background."""
         bg = self._blurred_background(frame_bgr) if self.blur_bg else self.background
 
-        alpha_u8 = (alpha * 255.0).astype(np.uint8)
+        alpha_u8 = self._alpha_u8
+        alpha_u8[:] = (alpha * 255.0).astype(np.uint8)
+        cv2.GaussianBlur(alpha_u8, self._feather_ksize, 0, dst=alpha_u8)
         alpha3 = cv2.merge([alpha_u8, alpha_u8, alpha_u8])
 
         # out = bg + (fg - bg) * alpha / 255, all in int16 then saturated to uint8.
@@ -799,9 +835,9 @@ class VCamWorker:
     DEFAULTS = dict(
         camera=0, width=1280, height=720, out_width=None, out_height=None,
         fps=30, engine="auto", mode="image", bg_path=None, color=(0, 177, 64),
-        mirror=False, multi_person=False, downsample=None, threads=None,
-        model="general", threshold=0.5, feather=1, erode=1, edge_radius=12,
-        temporal=0.5, mask_scale=1.0,
+        blur_image=False, blur_strength=1.0, mirror=False, multi_person=False,
+        downsample=None, threads=None, model="general", threshold=0.5, feather=1, erode=1,
+        edge_radius=12, temporal=0.5, mask_scale=1.0,
     )
 
     # Params that need the capture/engine/virtual-cam pipeline rebuilt (vs applied
@@ -835,13 +871,23 @@ class VCamWorker:
         if restart and self.running:
             self._restart.set()
 
-    def set_background(self, mode, path=None, color=None):
+    def set_background(self, mode, path=None, color=None, blur_image=None):
         with self._lock:
             self.cfg["mode"] = mode
             if path is not None:
                 self.cfg["bg_path"] = path
             if color is not None:
                 self.cfg["color"] = color
+            if blur_image is not None:
+                self.cfg["blur_image"] = blur_image
+            self._bg_dirty = True
+
+    def set_blur_strength(self, strength):
+        """Blur intensity for both live --blur mode and a blurred image
+        background. Rebuilds the compositor (like set_background) rather than
+        applying per-frame, since the sigma is baked into the compositor."""
+        with self._lock:
+            self.cfg["blur_strength"] = strength
             self._bg_dirty = True
 
     def set_quality(self, downsample):
@@ -871,14 +917,19 @@ class VCamWorker:
     # ---- internal ----
     def _build_compositor(self, width, height):
         mode = self.cfg["mode"]
+        strength = self.cfg.get("blur_strength", 1.0)
         if mode == "color":
             return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
         if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
             try:
-                return Compositor(width, height, load_background_image(self.cfg["bg_path"], width, height), False)
+                bg = load_background_image(self.cfg["bg_path"], width, height)
+                if self.cfg.get("blur_image"):
+                    bg = blur_background_image(bg, strength)
+                return Compositor(width, height, bg, False)
             except RuntimeError:
                 pass   # unreadable image -> fall back to blur
-        return Compositor(width, height, None, True)   # blur (and fallback when no image chosen)
+        # blur (and fallback when no image chosen)
+        return Compositor(width, height, None, True, blur_strength=strength)
 
     def _store_latest(self, out):
         with self._lock:

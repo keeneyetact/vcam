@@ -13,6 +13,10 @@ models/*.onnx
 backgrounds/*.local.*
 *.log
 
+# Personal local files (per-user background pic, launcher script)
+/2.png
+/start.cmd
+
 # PyInstaller build output (keep vcam.spec; ignore the artifacts)
 build/
 dist/

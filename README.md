@@ -43,7 +43,7 @@ any **Windows 10/11 (64-bit)** PC and double-click; no install required.
 Two caveats for "any computer":
 - It's a **Windows x64** binary (build separately for macOS/Linux).
 - The **virtual-camera output needs the OBS Virtual Camera** driver on the target
-  PC (install [OBS Studio](https://obsproject.com) once — the app's **Install**
+  PC (install [OBS Studio](https://obsproject.com) once — the app's **Set up virtual camera**
   button then registers it). Without it the app still runs and previews; it just
   can't appear as a camera in Meet. The RVM model is bundled, so no internet is
   needed for matting.
@@ -82,15 +82,23 @@ install `v4l2loopback`.
 python vcam_ui.py
 ```
 
-A small control panel:
+A control panel with the live preview front and centre:
 
-1. **Virtual camera** — Install / Uninstall the "OBS Virtual Camera" (so Meet can
-   see it). Shows whether it's currently installed. (Install/Uninstall need admin;
-   a Windows UAC prompt appears.)
-2. **Camera on / off** — start/stop feeding the virtual camera (ON = your webcam
-   is in use).
-3. **Background** — Blur, Image (pick any file), or Green screen — switchable live.
-4. Live preview, engine choice (RVM/MediaPipe), mirror, single-person toggle.
+1. **One-time setup** — shown only if the "OBS Virtual Camera" isn't registered
+   yet: one click registers it (Windows asks for admin), or it links you to
+   OBS Studio if the driver is missing and re-checks when you come back.
+2. **Start / Stop camera** (Ctrl+Enter) — feeds the virtual camera; the preview
+   shows a LIVE badge with fps. Problems appear as plain-language messages on
+   the preview (hover for the technical detail).
+3. **Camera** picker and **Mirror image**.
+4. **Background** — Blur, Image (Ctrl+O to pick a file; optional soften), or
+   Green screen — switchable live, with a blur-amount slider.
+5. **Advanced settings** — Performance (Sharp 720p / Smooth 30 fps), edge
+   detail, engine (Auto/RVM/MediaPipe), only-one-person, and driver
+   reinstall/uninstall.
+
+The window follows the Windows light/dark theme, is resizable and DPI-aware,
+and remembers your settings in `%APPDATA%\vcam\settings.json`.
 
 ### Option B — the command line
 

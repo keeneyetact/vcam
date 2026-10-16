@@ -91,8 +91,11 @@ A control panel with the live preview front and centre:
    shows a LIVE badge with fps. Problems appear as plain-language messages on
    the preview (hover for the technical detail).
 3. **Camera** picker and **Mirror image**.
-4. **Background** — Blur, Image (Ctrl+O to pick a file; optional soften), or
-   Green screen — switchable live, with a blur-amount slider.
+4. **Background** — Original (no effect), Blur, Image, or Green screen —
+   switchable live, with a blur-amount slider. Image opens a gallery: a
+   built-in default plus any pictures you add (**+ Add** or Ctrl+O; copied to
+   `%APPDATA%\vcam\backgrounds`). Click one to use it, ✕ to remove it (your
+   original file is untouched), and optionally soften it.
 5. **Advanced settings** — Performance (Sharp 720p / Smooth 30 fps), edge
    detail, engine (Auto/RVM/MediaPipe), only-one-person, and driver
    reinstall/uninstall.

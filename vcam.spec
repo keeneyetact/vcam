@@ -11,6 +11,7 @@ datas = [
     ("models/rvm_mobilenetv3_fp32.onnx", "models"),        # bundle the RVM model
     ("assets/icon.ico", "assets"),                          # window icon
     ("assets/icon-256.png", "assets"),
+    ("assets/backgrounds/default.jpg", "assets/backgrounds"),  # built-in background
 ]
 binaries = []
 hiddenimports = []

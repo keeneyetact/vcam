@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -160,6 +161,24 @@ def _settings_path() -> Path:
     return Path(base) / APP_NAME / "settings.json"
 
 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+BUILTIN_BG_DIR = vcam.BUNDLE_DIR / "assets" / "backgrounds"
+
+
+def _library_dir() -> Path:
+    """Where images the user adds are copied, so they survive the original
+    being moved or deleted."""
+    return _settings_path().parent / "backgrounds"
+
+
+def _list_images(folder: Path) -> list[Path]:
+    try:
+        files = [f for f in folder.iterdir() if f.suffix.lower() in IMAGE_EXTS and f.is_file()]
+    except OSError:
+        return []
+    return sorted(files, key=lambda f: (f.stat().st_mtime, f.name))
+
+
 def friendly_error(raw: str) -> str:
     """Turn a worker exception into a plain-language next step."""
     m = (raw or "").lower()
@@ -232,13 +251,21 @@ class VCamUI:
         self.c = PALETTES["dark" if self.dark else "light"]
 
         s = self._load_settings()
-        # Default to the user's image background if one sits next to the app.
-        default_img = vcam.HERE / "2.png"
         saved_img = s.get("bg_path")
-        if saved_img and Path(saved_img).is_file():
-            self.bg_path = saved_img
-        else:
-            self.bg_path = str(default_img) if default_img.is_file() else None
+        if not s.get("library_migrated"):
+            # One-time: bring the image picked before the library existed (and a
+            # personal 2.png next to the app) into the background library.
+            imported = {}
+            for old in (saved_img, str(vcam.HERE / "2.png")):
+                if old and Path(old).is_file() and not self._in_library(old):
+                    key = Path(old).resolve()
+                    if key not in imported:
+                        imported[key] = self._import_image(old)
+                    if imported[key] and old == saved_img:
+                        saved_img = imported[key]
+        self.bg_path = saved_img if saved_img and Path(saved_img).is_file() else None
+        if self.bg_path is None and self._library():
+            self.bg_path = str(self._library()[0][0])
 
         def pick(key, allowed, default):
             v = s.get(key, default)
@@ -537,11 +564,10 @@ class VCamUI:
         self.img_row = ttk.Frame(side)
         self.img_row.grid(row=row, column=0, sticky="ew", pady=(p(10), 0))
         self.img_row.columnconfigure(0, weight=1)
-        self.img_label = ttk.Label(self.img_row, text=self._img_name(), style="Muted.TLabel")
-        self.img_label.grid(row=0, column=0, sticky="w")
-        change = ttk.Button(self.img_row, text="Change image…", command=self._choose_image)
-        change.grid(row=0, column=1, sticky="e")
-        Tooltip(change, "Ctrl+O", self)
+        self.gallery = ttk.Frame(self.img_row)
+        self.gallery.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._gallery_thumbs = []
+        self._render_gallery()
         self.soften_cb = ttk.Checkbutton(self.img_row, text="Soften image (out-of-focus look)",
                                          variable=self.blur_image, command=self._apply_bg)
         self.soften_cb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(p(6), 0))
@@ -698,6 +724,133 @@ class VCamUI:
             self._thumbs[key] = ImageTk.PhotoImage(img)
             self._tiles[key].configure(image=self._thumbs[key])
 
+    # ------------------------------------------------------ image library --
+    def _library(self) -> list[tuple[Path, bool]]:
+        """(path, removable): built-in backgrounds first, then the user's."""
+        return ([(f, False) for f in _list_images(BUILTIN_BG_DIR)]
+                + [(f, True) for f in _list_images(_library_dir())])
+
+    def _in_library(self, path) -> bool:
+        try:
+            parent = Path(path).resolve().parent
+        except OSError:
+            return False
+        return parent in (BUILTIN_BG_DIR.resolve(), _library_dir().resolve())
+
+    def _import_image(self, src) -> str | None:
+        """Copy an image into the library; returns the copy's path."""
+        src = Path(src)
+        try:
+            with Image.open(src) as im:
+                im.verify()
+            lib = _library_dir()
+            lib.mkdir(parents=True, exist_ok=True)
+            dest, n = lib / src.name, 2
+            while dest.exists():
+                dest = lib / f"{src.stem}-{n}{src.suffix}"
+                n += 1
+            shutil.copy2(src, dest)
+            os.utime(dest)   # library order == order added
+            return str(dest)
+        except Exception:  # noqa: BLE001  (unreadable / not an image / disk error)
+            return None
+
+    def _render_gallery(self):
+        """Grid of background thumbnails: click to use, ✕ to remove, + to add."""
+        c, p = self.c, self.px
+        for w in self.gallery.winfo_children():
+            w.destroy()
+        self._gallery_thumbs = []
+        cols, tw, th = 3, p(84), p(47)
+        for i in range(cols):
+            self.gallery.columnconfigure(i, weight=1, uniform="gal")
+        selected = Path(self.bg_path).resolve() if self.bg_path else None
+        n = 0
+        for path, removable in self._library():
+            try:
+                with Image.open(path) as im:
+                    thumb = ImageTk.PhotoImage(ImageOps.fit(im.convert("RGB"), (tw, th)))
+            except Exception:  # noqa: BLE001
+                continue
+            self._gallery_thumbs.append(thumb)
+            is_sel = selected is not None and path.resolve() == selected
+            cell = tk.Frame(self.gallery, bg=c["surface"], highlightthickness=p(2),
+                            highlightbackground=c["accent"] if is_sel else c["surface"],
+                            highlightcolor=c["accent"], takefocus=1, cursor="hand2")
+            cell.grid(row=n // cols, column=n % cols, padx=p(2), pady=p(2))
+            n += 1
+            img = tk.Label(cell, image=thumb, bd=0, bg=c["surface"], cursor="hand2")
+            img.pack()
+            for w in (cell, img):
+                w.bind("<Button-1>", lambda _e, f=path: self._select_image(f))
+            cell.bind("<Return>", lambda _e, f=path: self._select_image(f))
+            cell.bind("<space>", lambda _e, f=path: self._select_image(f))
+            Tooltip(img, path.name if removable else "Built-in background", self)
+            if removable:
+                x = tk.Label(cell, text="✕", bg="#000000", fg="#ffffff", font=self.f_small,
+                             padx=p(4), pady=0, cursor="hand2")
+                x.place(relx=1.0, x=-p(3), y=p(3), anchor="ne")
+                x.bind("<Button-1>", lambda _e, f=path: self._remove_image(f))
+                cell.bind("<Delete>", lambda _e, f=path: self._remove_image(f))
+                Tooltip(x, "Remove", self)
+        add = tk.Label(self.gallery, text="+  Add", bg=c["tile"], fg=c["accent"],
+                       font=self.f_section, width=1, height=1, cursor="hand2",
+                       highlightthickness=1, highlightbackground=c["border"], takefocus=1)
+        add.grid(row=n // cols, column=n % cols, padx=p(2), pady=p(2), sticky="nsew")
+        add.bind("<Button-1>", lambda _e: self._add_images())
+        add.bind("<Return>", lambda _e: self._add_images())
+        Tooltip(add, "Add your own pictures (Ctrl+O)", self)
+
+    def _select_image(self, path):
+        self.bg_path = str(path)
+        self.mode.set("image")
+        self._refresh_images()
+        self.worker.set_background("image", path=self.bg_path, blur_image=self.blur_image.get())
+        self._sync_bg_controls()
+        self._schedule_save()
+
+    def _add_images(self) -> bool:
+        paths = filedialog.askopenfilenames(
+            title="Add background images",
+            filetypes=[("Images", " ".join(f"*{e}" for e in IMAGE_EXTS)), ("All files", "*.*")])
+        if not paths:
+            return False
+        added = [cp for cp in (self._import_image(p) for p in paths) if cp]
+        if len(added) < len(paths):
+            messagebox.showwarning(
+                "Add images",
+                f"{len(paths) - len(added)} file(s) couldn't be opened as an image and were skipped.")
+        if not added:
+            return False
+        self._select_image(added[-1])
+        return True
+
+    def _remove_image(self, path):
+        path = Path(path)
+        if not messagebox.askyesno("Remove background",
+                                   f"Remove “{path.name}” from your backgrounds?\n\n"
+                                   "Your original file isn't affected."):
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            messagebox.showerror("Remove background", f"Couldn't remove it: {exc}")
+            return
+        if self.bg_path and Path(self.bg_path).resolve() == path.resolve():
+            lib = self._library()
+            self.bg_path = str(lib[0][0]) if lib else None
+            if self.bg_path is None and self.mode.get() == "image":
+                self.mode.set("blur")
+            self.worker.set_background(self.mode.get(), path=self.bg_path,
+                                       blur_image=self.blur_image.get())
+        self._refresh_images()
+        self._sync_bg_controls()
+        self._schedule_save()
+
+    def _refresh_images(self):
+        self._render_gallery()
+        self._render_thumbs()
+
     # -------------------------------------------------------- persistence --
     def _load_settings(self) -> dict:
         try:
@@ -718,7 +871,7 @@ class VCamUI:
             bg_path=self.bg_path, blur_image=self.blur_image.get(),
             blur_strength=round(self.blur_strength.get(), 3), speed=self.speed.get(),
             quality=self.qbalance.get(), engine=self.engine.get(),
-            one_person=self.one_person.get(), advanced_open=self.adv_open,
+            one_person=self.one_person.get(), library_migrated=True, advanced_open=self.adv_open,
             sidebar_open=self.side_open,
         )
         try:
@@ -731,8 +884,8 @@ class VCamUI:
     # ----------------------------------------------------------- keyboard --
     def _bind_keys(self):
         self.root.bind("<Control-Return>", lambda _e: self._toggle())
-        self.root.bind("<Control-o>", lambda _e: self._choose_image())
-        self.root.bind("<Control-O>", lambda _e: self._choose_image())
+        self.root.bind("<Control-o>", lambda _e: self._add_images())
+        self.root.bind("<Control-O>", lambda _e: self._add_images())
         self.root.bind("<Control-b>", lambda _e: self._toggle_sidebar())
         self.root.bind("<Control-B>", lambda _e: self._toggle_sidebar())
         # Re-check the driver when the user comes back (e.g. after installing OBS).
@@ -740,9 +893,6 @@ class VCamUI:
                        and self._refresh_vc_status())
 
     # -------------------------------------------------------------- actions --
-    def _img_name(self):
-        return Path(self.bg_path).name if self.bg_path else "No image chosen"
-
     def _install(self):
         self._vcam_action(vcam.install_virtualcam, "Install", confirm=False)
 
@@ -849,8 +999,7 @@ class VCamUI:
         if self.worker.running or self.worker.status == "starting":
             self.worker.stop()
             return
-        mode = self.mode.get()
-        if mode == "image" and not self.bg_path and not self._choose_image():
+        if self.mode.get() == "image" and not self._ensure_image():
             return
         cw, ch, ow, oh = SPEED_MODES[self.speed.get()]
         self.worker.configure(
@@ -870,7 +1019,7 @@ class VCamUI:
 
     def _apply_bg(self):
         mode = self.mode.get()
-        if mode == "image" and not self.bg_path and not self._choose_image():
+        if mode == "image" and not self._ensure_image():
             self.mode.set("blur")
             mode = "blur"
         self.worker.set_background(mode, path=self.bg_path, blur_image=self.blur_image.get())
@@ -915,20 +1064,15 @@ class VCamUI:
         self.worker.configure(camera=self._cam_index())
         self._schedule_save()
 
-    def _choose_image(self) -> bool:
-        path = filedialog.askopenfilename(
-            title="Choose a background image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
-        if not path:
-            return False
-        self.bg_path = path
-        self.img_label.config(text=self._img_name())
-        self.mode.set("image")
-        self._render_thumbs()
-        self.worker.set_background("image", path=path, blur_image=self.blur_image.get())
-        self._sync_bg_controls()
-        self._schedule_save()
-        return True
+    def _ensure_image(self) -> bool:
+        """Image mode needs a picture: use the first in the library, else ask."""
+        if self.bg_path and Path(self.bg_path).is_file():
+            return True
+        lib = self._library()
+        if lib:
+            self._select_image(lib[0][0])
+            return True
+        return self._add_images()
 
     # ----------------------------------------------------------- main loop --
     def _on_preview_resize(self, _e=None):

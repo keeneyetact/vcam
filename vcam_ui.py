@@ -162,6 +162,7 @@ def _settings_path() -> Path:
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+MAX_LIBRARY_SIDE = 2560   # imported photos are downscaled to this (output is 720p)
 BUILTIN_BG_DIR = vcam.BUNDLE_DIR / "assets" / "backgrounds"
 
 
@@ -245,6 +246,8 @@ class VCamUI:
         self._busy = False
         self._last_state = None
         self._save_job = None
+        self._fit_cache = {}          # (path, mtime) -> small decoded PIL base image
+        self._cells = {}
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         self.dark = _system_prefers_dark()
@@ -701,13 +704,7 @@ class VCamUI:
         d.rectangle((0, th * 0.78, tw, th), fill=(140, 112, 90))
         blur = room.filter(ImageFilter.GaussianBlur(self.px(5)))
         # Image: the chosen picture (or a "+" placeholder).
-        if self.bg_path:
-            try:
-                pic = ImageOps.fit(Image.open(self.bg_path).convert("RGB"), (tw, th))
-            except Exception:  # noqa: BLE001
-                pic = None
-        else:
-            pic = None
+        pic = self._fitted(self.bg_path, tw, th) if self.bg_path else None
         if pic is None:
             pic = Image.new("RGB", (tw, th), (210, 214, 220) if not self.dark else (60, 66, 76))
             d = ImageDraw.Draw(pic)
@@ -738,7 +735,8 @@ class VCamUI:
         return parent in (BUILTIN_BG_DIR.resolve(), _library_dir().resolve())
 
     def _import_image(self, src) -> str | None:
-        """Copy an image into the library; returns the copy's path."""
+        """Copy an image into the library; returns the copy's path. Huge photos
+        are downscaled (output is 720p), so switching to them stays fast."""
         src = Path(src)
         try:
             with Image.open(src) as im:
@@ -749,11 +747,42 @@ class VCamUI:
             while dest.exists():
                 dest = lib / f"{src.stem}-{n}{src.suffix}"
                 n += 1
-            shutil.copy2(src, dest)
+            with Image.open(src) as im:
+                big = max(im.size) > MAX_LIBRARY_SIDE
+                if big:
+                    im = ImageOps.exif_transpose(im)   # bake rotation before resizing
+                    im.thumbnail((MAX_LIBRARY_SIDE, MAX_LIBRARY_SIDE), Image.LANCZOS)
+                    if dest.suffix.lower() in (".jpg", ".jpeg"):
+                        im.convert("RGB").save(dest, quality=92)
+                    else:
+                        im.save(dest)
+            if not big:
+                shutil.copy2(src, dest)
             os.utime(dest)   # library order == order added
             return str(dest)
         except Exception:  # noqa: BLE001  (unreadable / not an image / disk error)
             return None
+
+    def _fitted(self, path, tw, th):
+        """Cropped thumbnail (PIL) of `path`. Each photo is decoded once into a
+        small base image (a big photo takes ~150 ms); every thumbnail size is
+        cut from that."""
+        try:
+            key = (str(path), os.path.getmtime(path))
+        except OSError:
+            return None
+        base = self._fit_cache.get(key)
+        if base is None:
+            side = self.px(240)
+            try:
+                with Image.open(path) as im:
+                    im.draft("RGB", (side, side))   # JPEG: decode at reduced scale
+                    base = ImageOps.exif_transpose(im).convert("RGB")
+                    base.thumbnail((side * 2, side * 2))
+            except Exception:  # noqa: BLE001
+                return None
+            self._fit_cache[key] = base
+        return ImageOps.fit(base, (tw, th))
 
     def _render_gallery(self):
         """Grid of background thumbnails: click to use, ✕ to remove, + to add."""
@@ -761,22 +790,21 @@ class VCamUI:
         for w in self.gallery.winfo_children():
             w.destroy()
         self._gallery_thumbs = []
+        self._cells = {}
         cols, tw, th = 3, p(84), p(47)
         for i in range(cols):
             self.gallery.columnconfigure(i, weight=1, uniform="gal")
-        selected = Path(self.bg_path).resolve() if self.bg_path else None
         n = 0
         for path, removable in self._library():
-            try:
-                with Image.open(path) as im:
-                    thumb = ImageTk.PhotoImage(ImageOps.fit(im.convert("RGB"), (tw, th)))
-            except Exception:  # noqa: BLE001
+            pic = self._fitted(path, tw, th)
+            if pic is None:
                 continue
+            thumb = ImageTk.PhotoImage(pic)
             self._gallery_thumbs.append(thumb)
-            is_sel = selected is not None and path.resolve() == selected
             cell = tk.Frame(self.gallery, bg=c["surface"], highlightthickness=p(2),
-                            highlightbackground=c["accent"] if is_sel else c["surface"],
+                            highlightbackground=c["surface"],
                             highlightcolor=c["accent"], takefocus=1, cursor="hand2")
+            self._cells[path.resolve()] = cell
             cell.grid(row=n // cols, column=n % cols, padx=p(2), pady=p(2))
             n += 1
             img = tk.Label(cell, image=thumb, bd=0, bg=c["surface"], cursor="hand2")
@@ -800,12 +828,22 @@ class VCamUI:
         add.bind("<Button-1>", lambda _e: self._add_images())
         add.bind("<Return>", lambda _e: self._add_images())
         Tooltip(add, "Add your own pictures (Ctrl+O)", self)
+        self._mark_selected()
+
+    def _mark_selected(self):
+        sel = Path(self.bg_path).resolve() if self.bg_path else None
+        for path, cell in self._cells.items():
+            cell.configure(highlightbackground=self.c["accent"] if path == sel
+                           else self.c["surface"])
 
     def _select_image(self, path):
+        # Tell the worker first (it loads the picture on its own thread), then
+        # just move the highlight — no gallery rebuild, no re-decoding.
         self.bg_path = str(path)
         self.mode.set("image")
-        self._refresh_images()
         self.worker.set_background("image", path=self.bg_path, blur_image=self.blur_image.get())
+        self._mark_selected()
+        self._render_thumbs()
         self._sync_bg_controls()
         self._schedule_save()
 
@@ -822,6 +860,7 @@ class VCamUI:
                 f"{len(paths) - len(added)} file(s) couldn't be opened as an image and were skipped.")
         if not added:
             return False
+        self._render_gallery()
         self._select_image(added[-1])
         return True
 

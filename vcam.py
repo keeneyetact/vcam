@@ -42,6 +42,7 @@ import threading
 import time
 import types
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
@@ -861,6 +862,9 @@ class VCamWorker:
         self._lock = threading.Lock()
         self._latest = None          # latest processed BGR frame (for preview)
         self._bg_dirty = False
+        self._bg_gen = 0             # bumps per background change; stale loads are dropped
+        self._pending = None         # compositor finished by a loader thread
+        self._bg_cache = OrderedDict()   # (path, mtime, w, h) -> fitted background (LRU)
         self.running = False
         self.status = "stopped"      # stopped | starting | running | error
         self.error = None
@@ -922,23 +926,49 @@ class VCamWorker:
             self._thread.join(timeout=3.0)
 
     # ---- internal ----
-    def _build_compositor(self, width, height):
-        mode = self.cfg["mode"]
-        strength = self.cfg.get("blur_strength", 1.0)
+    def _build_compositor(self, cfg, width, height):
+        """Build from a cfg snapshot (no lock held: image decoding can be slow)."""
+        mode = cfg["mode"]
+        strength = cfg.get("blur_strength", 1.0)
         if mode == "none":
             return PassthroughCompositor()
         if mode == "color":
-            return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
-        if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
+            return Compositor(width, height, solid_color_background(cfg["color"], width, height), False)
+        if mode == "image" and cfg["bg_path"] and Path(cfg["bg_path"]).is_file():
             try:
-                bg = load_background_image(self.cfg["bg_path"], width, height)
-                if self.cfg.get("blur_image"):
+                bg = self._cached_background(cfg["bg_path"], width, height)
+                if cfg.get("blur_image"):
                     bg = blur_background_image(bg, strength)
                 return Compositor(width, height, bg, False)
-            except RuntimeError:
+            except (RuntimeError, OSError):
                 pass   # unreadable image -> fall back to blur
         # blur (and fallback when no image chosen)
         return Compositor(width, height, None, True, blur_strength=strength)
+
+    def _cached_background(self, path, width, height):
+        """Fitted background image; re-selecting a recent one is instant."""
+        key = (str(path), os.path.getmtime(path), width, height)
+        with self._lock:
+            bg = self._bg_cache.get(key)
+            if bg is not None:
+                self._bg_cache.move_to_end(key)
+                return bg
+        bg = load_background_image(path, width, height)
+        with self._lock:
+            self._bg_cache[key] = bg
+            while len(self._bg_cache) > 8:          # ~2.7 MB each at 720p
+                self._bg_cache.popitem(last=False)
+        return bg
+
+    def _load_compositor_async(self, gen, cfg, width, height):
+        """Build the new compositor off the frame loop; the old background keeps
+        streaming until it's ready, and a newer selection supersedes this one."""
+        def work():
+            comp = self._build_compositor(cfg, width, height)
+            with self._lock:
+                if gen == self._bg_gen:
+                    self._pending = comp
+        threading.Thread(target=work, daemon=True).start()
 
     def _store_latest(self, out):
         with self._lock:
@@ -976,8 +1006,11 @@ class VCamWorker:
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or cfg["height"]
             engine = make_engine(types.SimpleNamespace(**cfg), width, height)
             with self._lock:
-                compositor = self._build_compositor(width, height)
+                bg_cfg = dict(self.cfg)
                 self._bg_dirty = False
+                self._pending = None
+                self._bg_gen += 1
+            compositor = self._build_compositor(bg_cfg, width, height)
             # Output can be a different (larger) size than capture: matte the
             # small/fast frame, upscale the finished frame -> smooth 30 fps.
             out_w = cfg["out_width"] or width
@@ -1005,14 +1038,21 @@ class VCamWorker:
                     time.sleep(0.002)
                     continue
                 last_seq = seq
+                load = None
                 with self._lock:
                     if self._bg_dirty:
-                        compositor = self._build_compositor(width, height)
                         self._bg_dirty = False
+                        self._bg_gen += 1
+                        load = (self._bg_gen, dict(self.cfg))
+                    if self._pending is not None:
+                        compositor, self._pending = self._pending, None
                     mirror = self.cfg["mirror"]
                     want_dsr = self.cfg.get("downsample")
                     want_multi = self.cfg.get("multi_person")
-                    passthrough = self.cfg["mode"] == "none"
+                if load:
+                    self._load_compositor_async(load[0], load[1], width, height)
+                # Follow the compositor actually in use (a new one may still be loading).
+                passthrough = isinstance(compositor, PassthroughCompositor)
                 if mirror:
                     frame = cv2.flip(frame, 1)
                 if passthrough:

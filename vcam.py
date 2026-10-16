@@ -425,6 +425,13 @@ class Compositor:
         return self._out
 
 
+class PassthroughCompositor:
+    """"Original" mode: send the camera frame untouched (no background effect)."""
+
+    def render(self, frame_bgr, alpha):
+        return frame_bgr
+
+
 # --------------------------------------------------------------------------- #
 # Matting engines — each turns a BGR frame into (alpha matte, foreground|None)
 # --------------------------------------------------------------------------- #
@@ -918,6 +925,8 @@ class VCamWorker:
     def _build_compositor(self, width, height):
         mode = self.cfg["mode"]
         strength = self.cfg.get("blur_strength", 1.0)
+        if mode == "none":
+            return PassthroughCompositor()
         if mode == "color":
             return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
         if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
@@ -1003,8 +1012,17 @@ class VCamWorker:
                     mirror = self.cfg["mirror"]
                     want_dsr = self.cfg.get("downsample")
                     want_multi = self.cfg.get("multi_person")
+                    passthrough = self.cfg["mode"] == "none"
                 if mirror:
                     frame = cv2.flip(frame, 1)
+                if passthrough:
+                    # Original camera: skip matting entirely (saves the CPU);
+                    # the engine stays loaded so switching back is instant.
+                    pipeline.submit(compositor, frame, None, upscale)
+                    frames += 1
+                    if frames % 15 == 0:
+                        self.fps = frames / (time.time() - t0)
+                    continue
                 # Live, in-place option changes (no rebuild needed):
                 if want_dsr is not None and hasattr(engine, "set_downsample"):
                     engine.set_downsample(want_dsr)          # RVM quality dial

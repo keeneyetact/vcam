@@ -246,7 +246,7 @@ class VCamUI:
 
         self.cam_choice = tk.StringVar(value=pick("camera", CAMERAS, CAMERAS[0]))
         self.mirror = tk.BooleanVar(value=bool(s.get("mirror", False)))
-        mode = pick("mode", ("blur", "image", "color"), "image" if self.bg_path else "blur")
+        mode = pick("mode", ("none", "blur", "image", "color"), "image" if self.bg_path else "blur")
         self.mode = tk.StringVar(value="blur" if mode == "image" and not self.bg_path else mode)
         self.blur_image = tk.BooleanVar(value=bool(s.get("blur_image", False)))
         try:
@@ -259,6 +259,7 @@ class VCamUI:
         self.engine = tk.StringVar(value=pick("engine", ENGINES, ENGINE_DEFAULT))
         self.one_person = tk.BooleanVar(value=bool(s.get("one_person", True)))
         self.adv_open = bool(s.get("advanced_open", False))
+        self.side_open = bool(s.get("sidebar_open", True))
 
         self._setup_fonts()
         self._setup_style()
@@ -337,6 +338,13 @@ class VCamUI:
                bordercolor=[("active", c["surface"])],
                foreground=[("active", c["accent_hover"])])
 
+        st.configure("FooterLink.TButton", background=c["bg"], foreground=c["accent"],
+                     bordercolor=c["bg"], lightcolor=c["bg"], darkcolor=c["bg"],
+                     padding=(p(4), 0), font=self.f_section)
+        st.map("FooterLink.TButton", background=[("active", c["bg"])],
+               bordercolor=[("active", c["bg"])],
+               foreground=[("active", c["accent_hover"])])
+
         # Tiles / segmented controls: radio buttons drawn as bordered cards.
         st.layout("Tile.TRadiobutton", [
             ("Button.border", {"sticky": "nswe", "border": "1", "children": [
@@ -389,7 +397,8 @@ class VCamUI:
         self.root.rowconfigure(0, weight=1)
 
         # Left: preview ---------------------------------------------------------
-        left = ttk.Frame(self.root, style="Bg.TFrame", padding=(p(16), p(16), p(8), p(8)))
+        self.left = left = ttk.Frame(self.root, style="Bg.TFrame",
+                                     padding=(p(16), p(16), p(8), p(8)))
         left.grid(row=0, column=0, sticky="nsew")
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
@@ -414,10 +423,14 @@ class VCamUI:
         ttk.Label(footer, style="Footer.TLabel",
                   text=f"In Google Meet, Zoom or Teams, open video settings and choose "
                        f"“{VCAM_NAME}” as your camera.").grid(row=0, column=0, sticky="w")
+        self.side_btn = ttk.Button(footer, style="FooterLink.TButton",
+                                   command=self._toggle_sidebar)
+        self.side_btn.grid(row=0, column=1, sticky="e")
+        Tooltip(self.side_btn, "Ctrl+B  ·  Ctrl+Enter still starts / stops the camera", self)
 
         # Right: scrollable sidebar --------------------------------------------
-        side_wrap = tk.Frame(self.root, bg=c["surface"], highlightthickness=1,
-                             highlightbackground=c["border"])
+        self.side_wrap = side_wrap = tk.Frame(self.root, bg=c["surface"], highlightthickness=1,
+                                              highlightbackground=c["border"])
         side_wrap.grid(row=0, column=1, sticky="ns", padx=(p(8), p(16)), pady=p(16))
         side_wrap.rowconfigure(0, weight=1)
         canvas = tk.Canvas(side_wrap, bg=c["surface"], highlightthickness=0, bd=0,
@@ -506,14 +519,17 @@ class VCamUI:
         tiles.grid(row=row, column=0, sticky="ew")
         self._thumbs = {}
         self._tiles = {}
-        for i, (val, label) in enumerate((("blur", "Blur"), ("image", "Image"),
-                                          ("color", "Green screen"))):
-            tiles.columnconfigure(i, weight=1, uniform="tile")
+        tiles.columnconfigure((0, 1), weight=1, uniform="tile")
+        for i, (val, label) in enumerate((("none", "Original"), ("blur", "Blur"),
+                                          ("image", "Image"), ("color", "Green screen"))):
+            r, col = divmod(i, 2)
             t = ttk.Radiobutton(tiles, text=label, value=val, variable=self.mode,
                                 style="Tile.TRadiobutton", compound="top",
                                 command=self._apply_bg)
-            t.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else p(6), 0))
+            t.grid(row=r, column=col, sticky="ew", padx=(0 if col == 0 else p(6), 0),
+                   pady=(0 if r == 0 else p(6), 0))
             self._tiles[val] = t
+        Tooltip(self._tiles["none"], "Your real camera, no background effect.", self)
         Tooltip(self._tiles["color"], "Solid green — for apps (like OBS) that key it out.", self)
         self._render_thumbs()
         row += 1
@@ -559,6 +575,7 @@ class VCamUI:
         self.adv.columnconfigure(0, weight=1)
         self._build_advanced(self.adv)
         self._show_advanced(self.adv_open)
+        self._show_sidebar(self.side_open)
 
     def _build_advanced(self, f):
         p = self.px
@@ -636,7 +653,7 @@ class VCamUI:
 
     # ---------------------------------------------------------- thumbnails --
     def _thumb_size(self):
-        return self.px(84), self.px(48)
+        return self.px(120), self.px(66)
 
     def _with_person(self, img: Image.Image) -> Image.Image:
         w, h = img.size
@@ -650,13 +667,13 @@ class VCamUI:
 
     def _render_thumbs(self):
         tw, th = self._thumb_size()
-        # Blur: a soft, out-of-focus room.
-        blur = Image.new("RGB", (tw, th), (196, 184, 164))
-        d = ImageDraw.Draw(blur)
+        # Original: a room in focus; Blur: the same room out of focus.
+        room = Image.new("RGB", (tw, th), (196, 184, 164))
+        d = ImageDraw.Draw(room)
         d.rectangle((0, 0, tw * 0.45, th), fill=(120, 146, 176))
         d.rectangle((tw * 0.62, th * 0.15, tw * 0.9, th * 0.7), fill=(232, 220, 196))
         d.rectangle((0, th * 0.78, tw, th), fill=(140, 112, 90))
-        blur = blur.filter(ImageFilter.GaussianBlur(self.px(5)))
+        blur = room.filter(ImageFilter.GaussianBlur(self.px(5)))
         # Image: the chosen picture (or a "+" placeholder).
         if self.bg_path:
             try:
@@ -676,7 +693,8 @@ class VCamUI:
         else:
             image = self._with_person(pic)
         green = self._with_person(Image.new("RGB", (tw, th), (0, 177, 64)))
-        for key, img in (("blur", self._with_person(blur)), ("image", image), ("color", green)):
+        for key, img in (("none", self._with_person(room)), ("blur", self._with_person(blur)),
+                         ("image", image), ("color", green)):
             self._thumbs[key] = ImageTk.PhotoImage(img)
             self._tiles[key].configure(image=self._thumbs[key])
 
@@ -701,6 +719,7 @@ class VCamUI:
             blur_strength=round(self.blur_strength.get(), 3), speed=self.speed.get(),
             quality=self.qbalance.get(), engine=self.engine.get(),
             one_person=self.one_person.get(), advanced_open=self.adv_open,
+            sidebar_open=self.side_open,
         )
         try:
             path = _settings_path()
@@ -714,6 +733,8 @@ class VCamUI:
         self.root.bind("<Control-Return>", lambda _e: self._toggle())
         self.root.bind("<Control-o>", lambda _e: self._choose_image())
         self.root.bind("<Control-O>", lambda _e: self._choose_image())
+        self.root.bind("<Control-b>", lambda _e: self._toggle_sidebar())
+        self.root.bind("<Control-B>", lambda _e: self._toggle_sidebar())
         # Re-check the driver when the user comes back (e.g. after installing OBS).
         self.root.bind("<FocusIn>", lambda e: e.widget is self.root and not self._busy
                        and self._refresh_vc_status())
@@ -788,6 +809,25 @@ class VCamUI:
                                   else "disabled")
         self.install_btn.config(state="normal" if st["obs_found"] and not self._busy
                                 else "disabled")
+
+    def _toggle_sidebar(self):
+        self.side_open = not self.side_open
+        self._show_sidebar(self.side_open)
+        self._schedule_save()
+
+    def _show_sidebar(self, show):
+        """Collapse the controls so the preview gets the whole window."""
+        p = self.px
+        if show:
+            self.side_wrap.grid()
+            self.left.configure(padding=(p(16), p(16), p(8), p(8)))
+            self.side_btn.config(text="Hide controls  ▸")
+        else:
+            self.side_wrap.grid_remove()
+            self.root.unbind_all("<MouseWheel>")
+            self.left.configure(padding=(p(16), p(16), p(16), p(8)))
+            self.side_btn.config(text="◂  Show controls")
+        self._last_state = None   # refresh the placeholder hint on the next tick
 
     def _toggle_advanced(self):
         self.adv_open = not self.adv_open
@@ -925,8 +965,9 @@ class VCamUI:
 
         if state in ("stopped", "error"):
             self._preview_imgtk = None
-            self.preview.config(image="", text="Your camera is off\n\n"
-                                               "Press Start camera (Ctrl+Enter) to see your preview")
+            hint = ("Press Start camera (Ctrl+Enter) to see your preview" if self.side_open
+                    else "Press Ctrl+Enter to start, or Show controls below")
+            self.preview.config(image="", text=f"Your camera is off\n\n{hint}")
 
     def _tick(self):
         st = self.worker.status

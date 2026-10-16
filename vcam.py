@@ -178,7 +178,7 @@ def blur_background_image(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     h, w = img.shape[:2]
     sw, sh = max(1, w // 8), max(1, h // 8)
     small = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
-    sigma = 6.0 * max(0.1, strength)
+    sigma = 6.0 * max(0.01, strength)
     cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma, dst=small)
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -396,7 +396,7 @@ class Compositor:
         self._bh = max(90, height // 4)
         # Blur intensity (--blur mode only); 1.0 reproduces the original fixed
         # sigma. Exposed as the UI's "Blur strength" control.
-        self._blur_sigma = 4.0 * max(0.1, blur_strength)
+        self._blur_sigma = 4.0 * max(0.01, blur_strength)
         # Edge-feather kernel, scaled to resolution (odd, ≥3): ~3px @360p,
         # ~5px @720p. Gentle on purpose -- enough to kill the hard edge without
         # softening hair/hand detail away.

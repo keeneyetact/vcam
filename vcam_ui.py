@@ -81,11 +81,11 @@ ENGINE_DEFAULT = "Auto (recommended)"
 CAMERAS = [f"Camera {i + 1}" for i in range(6)]   # label index == device index
 
 # Blur sigma multiplier range for the "Blur amount" slider. Governs both the
-# live "Blur" background mode and the "Soften image" checkbox; 1.0 reproduces
+# live "Blur" background mode and the "Soften image" checkbox; 1.0 (the max) is
 # the original fixed blur amount. Applies live (rebuilds the compositor, no
 # camera reconnect).
-BLUR_MIN = 0.1
-BLUR_MAX = 3.0
+BLUR_MIN = 0.01
+BLUR_MAX = 1.0
 BLUR_DEFAULT = 0.25
 
 PALETTES = {
@@ -536,7 +536,7 @@ class VCamUI:
         self.blur_row.columnconfigure(0, weight=1)
         ttk.Label(self.blur_row, text="Blur amount").grid(row=0, column=0, sticky="w")
         self.blur_value_label = ttk.Label(self.blur_row, style="Muted.TLabel",
-                                          text=f"{self.blur_strength.get():.1f}×")
+                                          text=f"{self.blur_strength.get():.2f}×")
         self.blur_value_label.grid(row=0, column=1, sticky="e")
         ttk.Scale(self.blur_row, from_=BLUR_MIN, to=BLUR_MAX, orient="horizontal",
                   variable=self.blur_strength, command=self._on_blur_scale).grid(
@@ -841,7 +841,7 @@ class VCamUI:
         # Live: rebuilds the compositor with the new sigma (Blur mode and/or
         # Soften image), no camera reconnect.
         v = float(value)
-        self.blur_value_label.config(text=f"{v:.1f}×")
+        self.blur_value_label.config(text=f"{v:.2f}×")
         self.worker.set_blur_strength(v)
         self._schedule_save()
 

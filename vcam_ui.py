@@ -1161,7 +1161,9 @@ class VCamUI:
             self.pill.config(text=f"●  LIVE  ·  {self.worker.fps:.0f} fps{dev}",
                              fg="#ff5a5a")
 
-        frame = self.worker.latest_frame()
+        # Minimized: nobody sees the preview, so skip the resize + Tk image
+        # conversion (it competes with the camera threads for CPU and the GIL).
+        frame = self.worker.latest_frame() if self.root.state() != "iconic" else None
         if frame is not None:
             aw = self.preview_area.winfo_width()
             ah = self.preview_area.winfo_height()

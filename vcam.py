@@ -223,6 +223,58 @@ def open_camera(index: int, width: int, height: int, fps: int) -> cv2.VideoCaptu
     return cap
 
 
+_realtime_done = False
+
+
+def keep_realtime_when_background() -> None:
+    """Stop Windows from throttling us while the window is minimized/hidden.
+
+    Windows 11 treats a process with no visible window as background work: it
+    applies EcoQoS (on hybrid CPUs like 12th-14th gen Intel the matting threads
+    get parked on the slow E-cores) and ignores its timer-resolution request
+    (sleeps round up to ~15.6 ms). Either one makes the virtual camera stutter
+    in the meeting as soon as the app is minimized. Opt out of both, and run at
+    above-normal priority so the meeting app's own load can't starve us.
+    No-op off Windows; best-effort (older Windows lacks some of these calls)."""
+    global _realtime_done
+    if _realtime_done or not sys.platform.startswith("win"):
+        return
+    _realtime_done = True
+    import ctypes
+    from ctypes import wintypes
+
+    class _PowerThrottling(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Declare HANDLE types: ctypes' default int would truncate the 64-bit handle.
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    try:
+        k32.SetProcessInformation.argtypes = (wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD)
+    except AttributeError:
+        pass   # pre-Windows 8
+    proc = k32.GetCurrentProcess()
+    EXECUTION_SPEED, IGNORE_TIMER_RESOLUTION = 0x1, 0x4
+    # Control the bits but leave them off in StateMask == "never throttle me".
+    state = _PowerThrottling(1, EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, 0)
+    try:
+        k32.SetProcessInformation(proc, 4,   # ProcessPowerThrottling
+                                  ctypes.byref(state), ctypes.sizeof(state))
+    except (AttributeError, OSError):
+        pass
+    try:
+        k32.SetPriorityClass(proc, 0x8000)  # ABOVE_NORMAL_PRIORITY_CLASS
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except (AttributeError, OSError):
+        pass
+
+
 class FrameGrabber:
     """Continuously pulls frames in a background thread so the main loop never
     blocks on the camera. `cap.read()` can block for a full frame interval
@@ -232,7 +284,7 @@ class FrameGrabber:
 
     def __init__(self, cap: cv2.VideoCapture):
         self.cap = cap
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()   # notified on every new frame
         self._frame: np.ndarray | None = None
         self._seq = 0
         self.running = True
@@ -246,11 +298,14 @@ class FrameGrabber:
         while self.running:
             ok, frame = self.cap.read()
             if not ok:
-                self.running = False
                 break
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self._lock.notify_all()
+        with self._lock:
+            self.running = False
+            self._lock.notify_all()
 
     def read(self) -> tuple[int, np.ndarray | None]:
         """Return (sequence_number, latest_frame_copy). seq lets the caller skip
@@ -258,6 +313,18 @@ class FrameGrabber:
         with self._lock:
             if self._frame is None:
                 return self._seq, None
+            return self._seq, self._frame.copy()
+
+    def wait_next(self, last_seq: int, timeout: float = 0.5) -> tuple[int, np.ndarray | None]:
+        """Block until a frame newer than `last_seq` arrives (woken by the camera
+        thread, not by polling with sleep — sleeps get coarse when the app is in
+        the background). Returns (seq, copy), or (last_seq, None) on timeout or
+        when the camera has stopped."""
+        with self._lock:
+            self._lock.wait_for(lambda: self._seq != last_seq and self._frame is not None
+                                or not self.running, timeout)
+            if self._seq == last_seq or self._frame is None:
+                return last_seq, None
             return self._seq, self._frame.copy()
 
     def stop(self) -> None:
@@ -814,8 +881,10 @@ class OutputPipeline:
                 if upscale is not None and (out.shape[1], out.shape[0]) != upscale:
                     out = cv2.resize(out, upscale, interpolation=cv2.INTER_LINEAR)
                 if self._cam is not None:
+                    # No sleep_until_next_frame(): the webcam already paces us,
+                    # and pacing twice adds a sleep that turns into a stall
+                    # (and back-pressure on inference) when timers get coarse.
                     self._cam.send(out)
-                    self._cam.sleep_until_next_frame()
                 with self._lock:
                     self._latest = out
                 if self._on_output is not None:
@@ -914,6 +983,7 @@ class VCamWorker:
     def start(self):
         if self.running:
             return
+        keep_realtime_when_background()   # keep streaming smoothly when minimized
         self._stop.clear()
         self.error = None
         self.status = "starting"
@@ -1028,14 +1098,10 @@ class VCamWorker:
             while not self._stop.is_set() and not self._restart.is_set():
                 if pipeline.error is not None:
                     raise pipeline.error
-                seq, frame = grabber.read()
+                seq, frame = grabber.wait_next(last_seq, timeout=0.1)
                 if frame is None:
                     if not grabber.running:
                         raise RuntimeError("camera stopped delivering frames")
-                    time.sleep(0.002)
-                    continue
-                if seq == last_seq:
-                    time.sleep(0.002)
                     continue
                 last_seq = seq
                 load = None
@@ -1087,6 +1153,7 @@ class VCamWorker:
 
 
 def run(args: argparse.Namespace) -> int:
+    keep_realtime_when_background()
     cap = open_camera(args.camera, args.width, args.height, args.fps)
 
     # The camera may not honor the requested size; use what we actually get.
@@ -1148,15 +1215,13 @@ def run(args: argparse.Namespace) -> int:
         while True:
             if pipeline.error is not None:
                 raise pipeline.error
-            seq, frame_bgr = grabber.read()
+            seq, frame_bgr = grabber.wait_next(last_seq, timeout=0.1)
             if frame_bgr is None:
                 if not grabber.running:
                     print("[vcam] Failed to read frame from camera; stopping.")
                     break
-                time.sleep(0.002)  # camera still warming up
-                continue
-            if seq == last_seq:
-                time.sleep(0.002)  # no new frame yet; don't reprocess
+                if show_preview and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
                 continue
             last_seq = seq
 

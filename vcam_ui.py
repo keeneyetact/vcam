@@ -1131,6 +1131,7 @@ class VCamUI:
         if state == "starting":
             self.pill.config(text="●  Starting camera…", fg=c["warn"])
             self.pill.place(x=p(12), y=p(12))
+            self._preview_imgtk = None   # label is cleared; next frame makes a new image
             self.preview.config(image="", text="Starting your camera…\n"
                                                "The first start can take a few seconds.")
         elif state == "running":
@@ -1174,8 +1175,16 @@ class VCamUI:
                 interp = cv2.INTER_AREA if k < 1 else cv2.INTER_LINEAR
                 rgb = cv2.cvtColor(cv2.resize(frame, (tw, th), interpolation=interp),
                                    cv2.COLOR_BGR2RGB)
-                self._preview_imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
-                self.preview.config(image=self._preview_imgtk, text="")
+                pic = Image.fromarray(rgb)
+                # Paste into the existing Tk image while the size is unchanged:
+                # building a new PhotoImage every tick costs ~3 ms more of this
+                # thread's time (and CPU the matting loop could use).
+                if self._preview_imgtk is not None and \
+                        (self._preview_imgtk.width(), self._preview_imgtk.height()) == pic.size:
+                    self._preview_imgtk.paste(pic)
+                else:
+                    self._preview_imgtk = ImageTk.PhotoImage(pic)
+                    self.preview.config(image=self._preview_imgtk, text="")
 
         self.root.after(40, self._tick)
 

@@ -61,23 +61,29 @@ vcam automatically falls back to MediaPipe. On Windows/Intel-iGPU stick with the
 **CPU** build of onnxruntime (DirectML has correctness/perf issues with RVM's
 recurrent state); CPU runs ~20 fps at 720p, which exceeds most webcams' frame rate.
 
-### Optional: Rust kernels (a few % more fps)
+### Optional: Rust kernels (faster RVM)
 
-`native/` holds Rust versions of the per-frame pre/post-processing and the
-compositor. They give bit-identical output; vcam uses them when the
-`vcam_native` module is importable and otherwise falls back to numpy/OpenCV.
-Building needs [rustup](https://rustup.rs) and, on Windows, the Visual Studio
-C++ Build Tools plus the Windows SDK:
+`native/` holds Rust versions of the per-frame pre/post-processing, the
+compositor, and RVM's full-resolution output stage. vcam uses them when the
+`vcam_native` module is importable and otherwise falls back to numpy/OpenCV
+and the stock model. Building needs [rustup](https://rustup.rs) and, on
+Windows, the Visual Studio C++ Build Tools plus the Windows SDK:
 
 ```bash
-pip install "maturin>=1.7,<2"
+pip install "maturin>=1.7,<2" onnx
 cd native
 maturin build --release --out target/wheels
 pip install --force-reinstall target/wheels/vcam_native-*.whl
 ```
 
-`vcam.spec` bundles the module into `vcam.exe` when it's installed. Set
-`VCAM_NATIVE_THREADS` to change its thread pool size (default 4).
+With the module installed, vcam runs a truncated RVM model
+(`models/rvm_mobilenetv3_fp32_trunk.onnx`, built from the full model on first
+use, which needs `onnx`) and does the model's last stage -- upsampling the
+guided-filter coefficients and applying them at full resolution -- in one
+fused Rust pass on the output thread. The result matches the stock model to
+within float rounding. `vcam.spec` bundles both the module and the trunk model
+into `vcam.exe` when they're available. Set `VCAM_NATIVE_THREADS` to change
+the module's thread pool size (default 4).
 
 ### Virtual-camera backend (required to feed other apps)
 
@@ -215,10 +221,17 @@ the ceiling**, not the matting.
   per-channel foreground conversion, half-res connected-components);
 - onnxruntime threads capped to the fast cores (more threads *slow* this small
   recurrent net — on a 20-core i7-14700, 28 threads = 77 ms vs 8 threads = 48 ms);
-- the optional Rust kernels (`native/`) cut that remaining pre/post-processing
-  further and halve compositing time, for about +1–8% end-to-end fps. Inference
-  is ~85% of each frame and runs at the same speed from any language, so this
-  (not a rewrite) is about the ceiling for language-level gains.
+- RVM's post-processing (single-person isolation, foreground conversion) runs
+  on the output thread, overlapping the next inference (+10–14% fps);
+- with the optional Rust kernels (`native/`), RVM's full-resolution output
+  stage moves out of onnxruntime into one fused pass on the output thread
+  (onnxruntime's two full-res Resize ops were ~20% of inference). Measured on
+  an i7-14700, full loop: 720p/Balanced 23 → 26 fps, 720p/Fast 37 → 51 fps,
+  360p/Fine 57 → 62 fps, output identical to within float rounding.
+
+What's left is onnxruntime running the network itself. OpenVINO (CPU: slower;
+Intel iGPU: crashed) and int8 quantization (no faster, visibly worse edges)
+were tried and rejected.
 
 **The camera** is a per-device **resolution/fps tradeoff**: many webcams do
 1280×720 @ only ~10 fps but 640×480 @ 30 fps. At 720p you're camera-bound at

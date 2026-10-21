@@ -33,6 +33,7 @@ downloaded automatically on first run into ``models/``.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import queue
 import subprocess
@@ -142,6 +143,39 @@ def ensure_model(name: str) -> Path:
 
 def ensure_rvm_model() -> Path:
     return _download_model(RVM_MODEL["file"], RVM_MODEL["url"], "RobustVideoMatting")
+
+
+# RVM cut just before its deep-guided-filter tail: outputs the coarse guided-
+# filter coefficients A (tensor "777") and b ("779") instead of fgr/pha. The
+# tail -- upsample A and b to full resolution, out = A*x + b, clip -- is ~20% of
+# RVM's time at 720p (two full-res Resize ops plus elementwise passes), so the
+# native module does it in one fused pass (vcam_native.guided_upsample) on the
+# output thread instead. Built once from the full model; needs the `onnx`
+# package only to build it (the .exe ships it prebuilt).
+RVM_TRUNK_FILE = "rvm_mobilenetv3_fp32_trunk.onnx"
+RVM_TRUNK_OUTPUTS = ["777", "779", "r1o", "r2o", "r3o", "r4o"]
+
+
+def ensure_rvm_trunk() -> Path | None:
+    """Path of the truncated RVM model, building it if needed; None when it's
+    unavailable (not bundled and `onnx` isn't installed)."""
+    for cand in (BUNDLE_DIR / "models" / RVM_TRUNK_FILE, MODEL_DIR / RVM_TRUNK_FILE,
+                 _writable_model_dir() / RVM_TRUNK_FILE):
+        if cand.is_file() and cand.stat().st_size > 0:
+            return cand
+    try:
+        import onnx
+        import onnx.utils
+    except ImportError:
+        return None
+    path = _writable_model_dir() / RVM_TRUNK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    full = ensure_rvm_model()
+    inputs = [i.name for i in onnx.load(str(full), load_external_data=False).graph.input]
+    tmp = path.with_suffix(".tmp")
+    onnx.utils.extract_model(str(full), str(tmp), inputs, RVM_TRUNK_OUTPUTS)
+    tmp.replace(path)
+    return path
 
 
 def make_segmenter(model_path: Path) -> mp_vision.ImageSegmenter:
@@ -534,6 +568,16 @@ class RvmEngine:
         # 14700 all-28-logical = 77 ms vs 8 = 48 ms), so cap it. (Only the CPU
         # provider uses these; a GPU provider ignores them.)
         self.threads = int(threads) if threads else _rvm_thread_count()
+        # With the native module, run the truncated model and do RVM's full-res
+        # tail in Rust on the output thread (see ensure_rvm_trunk); otherwise the
+        # stock model. Either way the outputs are (2 tensors, r1o..r4o).
+        model = None
+        if vcam_native is not None and hasattr(vcam_native, "guided_upsample"):
+            try:
+                model = ensure_rvm_trunk()
+            except Exception as exc:  # noqa: BLE001  (fall back to the stock model)
+                print(f"[vcam] RVM trunk model unavailable ({exc}); using the full model")
+        self.trunk = model is not None
         # Pick the fastest WORKING execution provider. A GPU (DirectML/CUDA/...)
         # can be several times faster than the CPU — but only a capable one: an
         # integrated or old GPU is often *slower* than a many-core CPU for this
@@ -541,7 +585,7 @@ class RvmEngine:
         # time. So we verify and time-trial the GPU and only keep it when it
         # clearly beats the CPU; otherwise we stay on the (reliable) CPU.
         self.sess, self.provider, self.bench = _select_rvm_session(
-            ensure_rvm_model(), self.threads, width, height)
+            model or ensure_rvm_model(), self.threads, width, height)
         self.w, self.h = width, height
         self.single = bool(single_person)
         # downsample_ratio drives the coarse network's resolution and dominates
@@ -557,6 +601,13 @@ class RvmEngine:
         self._src = None        # reused NCHW input buffer (no per-frame realloc)
 
     def process(self, frame_bgr):
+        return self.finish(self.infer(frame_bgr))
+
+    def infer(self, frame_bgr):
+        """The serial half: input conversion + inference. Returns the raw model
+        outputs for `finish`. Only this has to run frame-by-frame in order (it
+        carries the recurrent state); `finish` can run on another thread, so the
+        next inference starts while this frame is still being post-processed."""
         h, w = frame_bgr.shape[:2]
         # Fill a reused float32 NCHW buffer directly (avoids astype + transpose
         # + ascontiguousarray copies: ~7.5 ms -> ~2 ms at 720p). RVM expects
@@ -570,10 +621,23 @@ class RvmEngine:
         else:
             src[0, 0], src[0, 1], src[0, 2] = frame_bgr[:, :, 2], frame_bgr[:, :, 1], frame_bgr[:, :, 0]
             np.multiply(src, np.float32(1.0 / 255.0), out=src)
-        fgr, pha, *self._rec = self.sess.run(
+        out0, out1, *self._rec = self.sess.run(
             [], {"src": src, "r1i": self._rec[0], "r2i": self._rec[1],
                  "r3i": self._rec[2], "r4i": self._rec[3], "downsample_ratio": self._dsr}
         )
+        # Trunk model: coarse guided-filter coefficients (A, b) + the frame they
+        # apply to. Stock model: (fgr, pha).
+        return (out0, out1, frame_bgr) if self.trunk else (out0, out1)
+
+    def finish(self, raw):
+        """Raw outputs from `infer` -> (alpha HxW float [0,1], foreground BGR uint8)."""
+        if self.trunk:
+            a, b, frame_bgr = raw
+            alpha, fg = vcam_native.guided_upsample(a, b, np.ascontiguousarray(frame_bgr))
+            if self.single:
+                alpha = _keep_largest(alpha)
+            return alpha, fg
+        fgr, pha = raw
         alpha = pha[0, 0]                                            # HxW float [0,1]
         if self.single:
             alpha = _keep_largest(alpha)
@@ -861,10 +925,11 @@ class OutputPipeline:
     """Runs compositing + virtual-cam send on a worker thread so that work
     overlaps the *next* frame's inference instead of waiting behind it.
 
-    The matte (engine.process) is a serial ~58 ms wall — each frame feeds the
+    The matte (engine.infer) is a serial ~40 ms wall — each frame feeds the
     recurrent state into the next, so inferences can't overlap each other. But
-    the ~10-15 ms of compositing + cam.send AFTER inference don't depend on the
-    next frame, so doing them on a second thread hides them behind the next
+    the engine's post-processing (single-person isolation, foreground conversion)
+    and the compositing + cam.send AFTER inference don't depend on the next
+    frame, so doing them on a second thread hides them behind the next
     inference. Frames are handled in submit order and the output is byte-for-byte
     identical to doing it inline — a pure throughput win (~10-15% in Sharp mode),
     costing one extra frame of latency (imperceptible for a webcam).
@@ -880,12 +945,14 @@ class OutputPipeline:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, compositor, source_bgr, alpha, upscale=None):
+    def submit(self, compositor, source_bgr, alpha, upscale=None, finish=None):
         """Hand one frame's render+send to the worker. Blocks (back-pressure) if
-        the worker is two frames behind; raises if the worker has failed."""
+        the worker is two frames behind; raises if the worker has failed.
+        `finish`, if given, is called on the worker first and returns
+        (alpha, foreground|None) -- the engine's deferred post-processing."""
         if self.error is not None:
             raise self.error
-        self._q.put((compositor, source_bgr, alpha, upscale))
+        self._q.put((compositor, source_bgr, alpha, upscale, finish))
 
     def latest(self):
         """Most recently sent output frame (for preview); None until the first."""
@@ -900,7 +967,11 @@ class OutputPipeline:
             if self.error is not None:
                 continue                     # drain quietly so submit() never blocks
             try:
-                compositor, source_bgr, alpha, upscale = item
+                compositor, source_bgr, alpha, upscale, finish = item
+                if finish is not None:
+                    alpha, fg = finish()
+                    if fg is not None:
+                        source_bgr = fg
                 out = compositor.render(source_bgr, alpha)
                 if upscale is not None and (out.shape[1], out.shape[0]) != upscale:
                     out = cv2.resize(out, upscale, interpolation=cv2.INTER_LINEAR)
@@ -1158,8 +1229,15 @@ class VCamWorker:
                     engine.set_downsample(want_dsr)          # RVM quality dial
                 if want_multi is not None and hasattr(engine, "set_single_person"):
                     engine.set_single_person(not want_multi)  # only-one-person
-                alpha, fg = engine.process(frame)
-                pipeline.submit(compositor, fg if fg is not None else frame, alpha, upscale)
+                if hasattr(engine, "infer"):
+                    # Only inference runs here; the post-processing happens on
+                    # the output thread, overlapping the next inference.
+                    raw = engine.infer(frame)
+                    pipeline.submit(compositor, frame, None, upscale,
+                                    finish=functools.partial(engine.finish, raw))
+                else:
+                    alpha, fg = engine.process(frame)
+                    pipeline.submit(compositor, fg if fg is not None else frame, alpha, upscale)
                 frames += 1
                 if frames % 15 == 0:
                     self.fps = frames / (time.time() - t0)
@@ -1252,10 +1330,15 @@ def run(args: argparse.Namespace) -> int:
             if args.mirror:
                 frame_bgr = cv2.flip(frame_bgr, 1)
 
-            alpha, foreground = engine.process(frame_bgr)
-            # RVM returns a colour-decontaminated foreground; otherwise use the frame.
-            pipeline.submit(compositor, foreground if foreground is not None else frame_bgr,
-                            alpha, upscale)
+            if hasattr(engine, "infer"):
+                # RVM: infer here, post-process on the output thread (overlaps
+                # the next inference); it returns a colour-decontaminated foreground.
+                pipeline.submit(compositor, frame_bgr, None, upscale,
+                                finish=functools.partial(engine.finish, engine.infer(frame_bgr)))
+            else:
+                alpha, foreground = engine.process(frame_bgr)
+                pipeline.submit(compositor, foreground if foreground is not None else frame_bgr,
+                                alpha, upscale)
 
             if show_preview:
                 preview = pipeline.latest()

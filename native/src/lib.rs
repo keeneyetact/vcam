@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 
 use numpy::{
-    PyArray3, PyArrayMethods, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
+    PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
     PyReadwriteArray2, PyReadwriteArray3, PyReadwriteArray4, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
@@ -140,6 +140,97 @@ fn fgr_to_bgr<'py>(
         });
     }
     Ok(out)
+}
+
+/// One output coordinate of ONNX Resize (mode=linear,
+/// coordinate_transformation_mode=pytorch_half_pixel): the two source indices
+/// and the weight of the second, exactly as onnxruntime computes them.
+#[inline]
+fn resize_coord(o: usize, out_len: usize, in_len: usize) -> (usize, usize, f32) {
+    let scale = out_len as f32 / in_len as f32;
+    let x = if out_len > 1 { (o as f32 + 0.5) / scale - 0.5 } else { 0.0 };
+    let x = x.clamp(0.0, (in_len - 1) as f32);
+    let x0 = x as usize;
+    (x0, (x0 + 1).min(in_len - 1), x - x0 as f32)
+}
+
+/// RVM's deep-guided-filter tail, fused: upsample the coarse coefficient maps
+/// `a` and `b` (1,4,h,w) to the frame's size, apply them to the frame and
+/// return (alpha HxW float32, foreground BGR uint8 HxWx3) as new arrays:
+///     x       = [R, G, B, mean(R,G,B)] of the frame in [0, 1]
+///     out     = up(a) * x + up(b)
+///     fgr     = clip(out[0:3] + x[0:3], 0, 1)       (-> BGR uint8)
+///     alpha   = clip(out[3], 0, 1)
+/// This is the graph after tensors 777 (a) / 779 (b) of rvm_mobilenetv3: two
+/// full-resolution Resize ops plus Mul/Add/Clip that onnxruntime runs as ~6
+/// separate full-size passes, and fgr_to_bgr on top.
+#[pyfunction]
+fn guided_upsample<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray4<'py, f32>,
+    b: PyReadonlyArray4<'py, f32>,
+    frame: PyReadonlyArray3<'py, u8>,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray3<u8>>)> {
+    let (h, w) = hw3(frame.shape(), "frame")?;
+    let (ch, cw) = match a.shape() {
+        [1, 4, ch, cw] if *ch > 0 && *cw > 0 => (*ch, *cw),
+        _ => return Err(bad("a must be float32 (1, 4, h, w)")),
+    };
+    if b.shape() != a.shape() {
+        return Err(bad("b must have the same shape as a"));
+    }
+    let (av, bv, f) = (a.as_slice()?, b.as_slice()?, frame.as_slice()?);
+    // SAFETY: every element of both arrays is written below before returning.
+    let alpha = unsafe { PyArray2::<f32>::new(py, [h, w], false) };
+    let fg = unsafe { PyArray3::<u8>::new(py, [h, w, 3], false) };
+    {
+        let mut alpha_rw = alpha.readwrite();
+        let mut fg_rw = fg.readwrite();
+        let (ao, fo) = (alpha_rw.as_slice_mut()?, fg_rw.as_slice_mut()?);
+        let cols: Vec<(usize, usize, f32)> = (0..w).map(|x| resize_coord(x, w, cw)).collect();
+        let plane = ch * cw;
+        py.allow_threads(|| {
+            pool().install(|| {
+                ao.par_chunks_mut(w)
+                    .zip(fo.par_chunks_mut(w * 3))
+                    .zip(f.par_chunks(w * 3))
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0f32; 8 * cw],
+                        |rows, (y, ((arow, frow_out), frow))| {
+                            // Vertical pass: blend the two coarse rows of all 8
+                            // coefficient planes once per output row.
+                            let (y0, y1, dy) = resize_coord(y, h, ch);
+                            for c in 0..8 {
+                                let src = if c < 4 { av } else { bv };
+                                let p = &src[(c % 4) * plane..];
+                                let (r0, r1) = (&p[y0 * cw..][..cw], &p[y1 * cw..][..cw]);
+                                for (d, (&u, &v)) in rows[c * cw..][..cw].iter_mut().zip(r0.iter().zip(r1)) {
+                                    *d = u * (1.0 - dy) + v * dy;
+                                }
+                            }
+                            // Horizontal pass + guided-filter apply, per pixel.
+                            for (x, &(x0, x1, dx)) in cols.iter().enumerate() {
+                                let up = |c: usize| {
+                                    let r = &rows[c * cw..];
+                                    r[x0] * (1.0 - dx) + r[x1] * dx
+                                };
+                                let px = &frow[x * 3..x * 3 + 3];
+                                let rgb = [px[2] as f32 * INV255, px[1] as f32 * INV255, px[0] as f32 * INV255];
+                                let mean = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+                                let out = &mut frow_out[x * 3..x * 3 + 3];
+                                for c in 0..3 {
+                                    let v = (up(c) * rgb[c] + up(4 + c) + rgb[c]).clamp(0.0, 1.0);
+                                    out[2 - c] = unit_to_u8(v); // RGB -> BGR
+                                }
+                                arow[x] = (up(3) * mean + up(7)).clamp(0.0, 1.0);
+                            }
+                        },
+                    );
+            });
+        });
+    }
+    Ok((alpha, fg))
 }
 
 // --------------------------------------------------------------------------- //
@@ -449,6 +540,7 @@ fn composite(
 fn vcam_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fill_src, m)?)?;
     m.add_function(wrap_pyfunction!(fgr_to_bgr, m)?)?;
+    m.add_function(wrap_pyfunction!(guided_upsample, m)?)?;
     m.add_function(wrap_pyfunction!(keep_largest, m)?)?;
     m.add_function(wrap_pyfunction!(composite, m)?)?;
     Ok(())

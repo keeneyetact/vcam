@@ -5,6 +5,7 @@ Build:  pyinstaller --noconfirm vcam.spec
 Output: dist/vcam.exe
 """
 import os
+import sys
 from PyInstaller.utils.hooks import collect_all
 
 datas = [
@@ -13,6 +14,17 @@ datas = [
     ("assets/icon-256.png", "assets"),
     ("assets/backgrounds/default.jpg", "assets/backgrounds"),  # built-in background
 ]
+
+# The truncated RVM model used with the Rust kernels (vcam.ensure_rvm_trunk).
+# Built here so the exe doesn't need the `onnx` package at runtime; skipped
+# (the exe then runs the full model) when onnx / vcam_native aren't installed.
+sys.path.insert(0, SPECPATH)
+try:
+    import vcam
+    if vcam.vcam_native is not None and (trunk := vcam.ensure_rvm_trunk()) is not None:
+        datas.append((str(trunk), "models"))
+except Exception as exc:  # noqa: BLE001
+    print(f"vcam.spec: not bundling the RVM trunk model ({exc})")
 binaries = []
 hiddenimports = []
 
@@ -48,7 +60,10 @@ a = Analysis(
               "torch", "pandas", "scipy", "IPython", "notebook",
               "yt_dlp", "websockets", "requests", "urllib3", "mutagen",
               "brotli", "brotlicffi", "certifi", "secretstorage",
-              "curl_cffi", "Cryptodome"],
+              "curl_cffi", "Cryptodome",
+              # Only needed to *build* the RVM trunk model, which is bundled
+              # prebuilt (and openvino was only ever benchmarked).
+              "onnx", "onnx_ir", "google.protobuf", "openvino"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

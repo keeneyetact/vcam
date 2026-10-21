@@ -18,6 +18,9 @@ backgrounds/*.local.*
 /2.png
 /start.cmd
 
+# Rust build output for the native kernels
+native/target/
+
 # PyInstaller build output (keep vcam.spec; ignore the artifacts)
 build/
 dist/

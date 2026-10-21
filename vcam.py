@@ -69,6 +69,14 @@ try:
 except ImportError:  # pragma: no cover
     ort = None
 
+# Optional Rust kernels (native/, built with maturin) for the per-frame pre/post-
+# processing and compositing. Same results as the numpy/OpenCV code they replace,
+# which stays as the fallback. None == not built; everything still works.
+try:
+    import vcam_native
+except ImportError:  # pragma: no cover
+    vcam_native = None
+
 
 HERE = Path(__file__).resolve().parent
 # When frozen by PyInstaller, bundled data lives under sys._MEIPASS.
@@ -453,7 +461,9 @@ class Compositor:
 
     def __init__(self, width, height, background_bgr, blur_bg, blur_strength=1.0):
         self.w, self.h = width, height
-        self.background = background_bgr        # None in blur mode
+        # None in blur mode. Made contiguous once (resize_cover returns a cropped
+        # view) so the native compositor can take it as-is every frame.
+        self.background = None if background_bgr is None else np.ascontiguousarray(background_bgr)
         self.blur_bg = blur_bg
         # Reused scratch buffers (allocated once).
         self._diff = np.empty((height, width, 3), np.int16)
@@ -480,6 +490,12 @@ class Compositor:
     def render(self, frame_bgr, alpha):
         """`alpha` is a HxW float32 matte in [0, 1]; 1 == person, 0 == background."""
         bg = self._blurred_background(frame_bgr) if self.blur_bg else self.background
+
+        if vcam_native is not None and alpha.dtype == np.float32 and alpha.flags.c_contiguous:
+            # Feather + blend fused in one multi-threaded pass (~7 ms -> ~2 ms).
+            vcam_native.composite(np.ascontiguousarray(frame_bgr), bg, alpha,
+                                  self._out, self._feather_ksize[0])
+            return self._out
 
         alpha_u8 = self._alpha_u8
         alpha_u8[:] = (alpha * 255.0).astype(np.uint8)
@@ -549,8 +565,11 @@ class RvmEngine:
         if self._src is None or self._src.shape[2:] != (h, w):
             self._src = np.empty((1, 3, h, w), np.float32)
         src = self._src
-        src[0, 0], src[0, 1], src[0, 2] = frame_bgr[:, :, 2], frame_bgr[:, :, 1], frame_bgr[:, :, 0]
-        np.multiply(src, np.float32(1.0 / 255.0), out=src)
+        if vcam_native is not None:
+            vcam_native.fill_src(np.ascontiguousarray(frame_bgr), src)
+        else:
+            src[0, 0], src[0, 1], src[0, 2] = frame_bgr[:, :, 2], frame_bgr[:, :, 1], frame_bgr[:, :, 0]
+            np.multiply(src, np.float32(1.0 / 255.0), out=src)
         fgr, pha, *self._rec = self.sess.run(
             [], {"src": src, "r1i": self._rec[0], "r2i": self._rec[1],
                  "r3i": self._rec[2], "r4i": self._rec[3], "downsample_ratio": self._dsr}
@@ -558,6 +577,8 @@ class RvmEngine:
         alpha = pha[0, 0]                                            # HxW float [0,1]
         if self.single:
             alpha = _keep_largest(alpha)
+        if vcam_native is not None:
+            return alpha, vcam_native.fgr_to_bgr(fgr)
         # Foreground RGB (3,H,W) float -> BGR uint8 HWC via per-channel saturating
         # scale + merge (~9.3 ms -> ~1.3 ms at 720p; no transpose copy / cvtColor).
         fg = fgr[0]
@@ -706,6 +727,9 @@ def _keep_largest(alpha):
     """Keep only the single largest person blob in a soft alpha matte; suppress
     the rest while preserving the kept subject's soft edges. Connected components
     run at half resolution (blobs are large) — ~6 ms -> ~3 ms at 720p."""
+    if vcam_native is not None and alpha.dtype == np.float32 and alpha.flags.c_contiguous:
+        vcam_native.keep_largest(alpha)   # in place, no full-size temporaries
+        return alpha
     h, w = alpha.shape[:2]
     small = cv2.resize(alpha, (w // 2, h // 2), interpolation=cv2.INTER_LINEAR) if max(h, w) > 640 else alpha
     binary = (small > 0.5).astype(np.uint8)

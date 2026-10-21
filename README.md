@@ -61,6 +61,24 @@ vcam automatically falls back to MediaPipe. On Windows/Intel-iGPU stick with the
 **CPU** build of onnxruntime (DirectML has correctness/perf issues with RVM's
 recurrent state); CPU runs ~20 fps at 720p, which exceeds most webcams' frame rate.
 
+### Optional: Rust kernels (a few % more fps)
+
+`native/` holds Rust versions of the per-frame pre/post-processing and the
+compositor. They give bit-identical output; vcam uses them when the
+`vcam_native` module is importable and otherwise falls back to numpy/OpenCV.
+Building needs [rustup](https://rustup.rs) and, on Windows, the Visual Studio
+C++ Build Tools plus the Windows SDK:
+
+```bash
+pip install "maturin>=1.7,<2"
+cd native
+maturin build --release --out target/wheels
+pip install --force-reinstall target/wheels/vcam_native-*.whl
+```
+
+`vcam.spec` bundles the module into `vcam.exe` when it's installed. Set
+`VCAM_NATIVE_THREADS` to change its thread pool size (default 4).
+
 ### Virtual-camera backend (required to feed other apps)
 
 `pyvirtualcam` needs an OS virtual-camera driver. On **Windows** the easiest is
@@ -196,7 +214,11 @@ the ceiling**, not the matting.
 - pre/post-processing trimmed from ~31 ms to ~6 ms (reused NCHW input buffer,
   per-channel foreground conversion, half-res connected-components);
 - onnxruntime threads capped to the fast cores (more threads *slow* this small
-  recurrent net — on a 20-core i7-14700, 28 threads = 77 ms vs 8 threads = 48 ms).
+  recurrent net — on a 20-core i7-14700, 28 threads = 77 ms vs 8 threads = 48 ms);
+- the optional Rust kernels (`native/`) cut that remaining pre/post-processing
+  further and halve compositing time, for about +1–8% end-to-end fps. Inference
+  is ~85% of each frame and runs at the same speed from any language, so this
+  (not a rewrite) is about the ceiling for language-level gains.
 
 **The camera** is a per-device **resolution/fps tradeoff**: many webcams do
 1280×720 @ only ~10 fps but 640×480 @ 30 fps. At 720p you're camera-bound at

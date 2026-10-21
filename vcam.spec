@@ -17,7 +17,9 @@ binaries = []
 hiddenimports = []
 
 # Native packages whose DLLs/data PyInstaller's default analysis can miss.
-for pkg in ("onnxruntime", "pyvirtualcam", "cv2"):
+# vcam_native is the optional Rust kernels (native/); without it the exe still
+# works on the numpy/OpenCV fallbacks.
+for pkg in ("onnxruntime", "pyvirtualcam", "cv2", "vcam_native"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

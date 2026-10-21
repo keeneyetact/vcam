@@ -227,7 +227,14 @@ the ceiling**, not the matting.
   stage moves out of onnxruntime into one fused pass on the output thread
   (onnxruntime's two full-res Resize ops were ~20% of inference). Measured on
   an i7-14700, full loop: 720p/Balanced 23 → 26 fps, 720p/Fast 37 → 51 fps,
-  360p/Fine 57 → 62 fps, output identical to within float rounding.
+  360p/Fine 57 → 62 fps, output identical to within float rounding;
+- on the CPU, that model also runs as a 3-stage pipeline (encoder | recurrent
+  core | tail, split automatically at the recurrent state; one onnxruntime
+  session + thread each), so consecutive frames are in different stages at
+  once. onnxruntime stops scaling past ~8 threads on this model, so three
+  sessions use a many-core CPU better: +14–24% fps end to end (720p/Fine
+  16 → 19 fps, 720p/Balanced 28 → 34 fps), identical output, two frames more
+  latency.
 
 What's left is onnxruntime running the network itself. OpenVINO (CPU: slower;
 Intel iGPU: crashed) and int8 quantization (no faster, visibly worse edges)

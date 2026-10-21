@@ -15,14 +15,16 @@ datas = [
     ("assets/backgrounds/default.jpg", "assets/backgrounds"),  # built-in background
 ]
 
-# The truncated RVM model used with the Rust kernels (vcam.ensure_rvm_trunk).
-# Built here so the exe doesn't need the `onnx` package at runtime; skipped
-# (the exe then runs the full model) when onnx / vcam_native aren't installed.
+# The truncated RVM model used with the Rust kernels (vcam.ensure_rvm_trunk)
+# and its three pipeline stages (vcam.ensure_rvm_stages). Built here so the exe
+# doesn't need the `onnx` package at runtime; skipped (the exe then runs the
+# full model) when onnx / vcam_native aren't installed.
 sys.path.insert(0, SPECPATH)
 try:
     import vcam
     if vcam.vcam_native is not None and (trunk := vcam.ensure_rvm_trunk()) is not None:
         datas.append((str(trunk), "models"))
+        datas += [(str(p), "models") for p in (vcam.ensure_rvm_stages() or [])]
 except Exception as exc:  # noqa: BLE001
     print(f"vcam.spec: not bundling the RVM trunk model ({exc})")
 binaries = []

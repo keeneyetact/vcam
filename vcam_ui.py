@@ -33,7 +33,6 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
-import cv2
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 import vcam
@@ -243,6 +242,7 @@ class VCamUI:
         root.title("vcam — Virtual Camera")
         self.worker = vcam.VCamWorker()
         self._preview_imgtk = None
+        self._preview_shown = None   # the worker preview array currently displayed
         self._busy = False
         self._last_state = None
         self._save_job = None
@@ -1162,29 +1162,32 @@ class VCamUI:
             self.pill.config(text=f"●  LIVE  ·  {self.worker.fps:.0f} fps{dev}",
                              fg="#ff5a5a")
 
-        # Minimized: nobody sees the preview, so skip the resize + Tk image
-        # conversion (it competes with the camera threads for CPU and the GIL).
-        frame = self.worker.latest_frame() if self.root.state() != "iconic" else None
-        if frame is not None:
-            aw = self.preview_area.winfo_width()
-            ah = self.preview_area.winfo_height()
-            h, w = frame.shape[:2]
-            k = min(aw / w, ah / h)
-            tw, th = int(w * k), int(h * k)
-            if tw > 2 and th > 2:
-                interp = cv2.INTER_AREA if k < 1 else cv2.INTER_LINEAR
-                rgb = cv2.cvtColor(cv2.resize(frame, (tw, th), interpolation=interp),
-                                   cv2.COLOR_BGR2RGB)
-                pic = Image.fromarray(rgb)
-                # Paste into the existing Tk image while the size is unchanged:
-                # building a new PhotoImage every tick costs ~3 ms more of this
-                # thread's time (and CPU the matting loop could use).
-                if self._preview_imgtk is not None and \
-                        (self._preview_imgtk.width(), self._preview_imgtk.height()) == pic.size:
-                    self._preview_imgtk.paste(pic)
-                else:
-                    self._preview_imgtk = ImageTk.PhotoImage(pic)
-                    self.preview.config(image=self._preview_imgtk, text="")
+        # The worker's output thread builds the preview already fitted to the
+        # preview area and in RGB, so this (Tk) thread only displays it. While
+        # minimized nobody sees it, so ask for none (saves the CPU for matting).
+        if self.root.state() == "iconic":
+            self.worker.preview_box = None
+            rgb = None
+        else:
+            self.worker.preview_box = (self.preview_area.winfo_width(),
+                                       self.preview_area.winfo_height())
+            rgb = self.worker.latest_preview()
+            if rgb is self._preview_shown and self._preview_imgtk is not None:
+                rgb = None               # no new frame since the last tick
+        if rgb is not None:
+            self._preview_shown = rgb
+            th, tw = rgb.shape[:2]
+            # Wraps the worker's array without copying (it's never written again).
+            pic = Image.frombuffer("RGB", (tw, th), rgb, "raw", "RGB", 0, 1)
+            # Paste into the existing Tk image while the size is unchanged:
+            # building a new PhotoImage every tick costs ~3 ms more of this
+            # thread's time (and CPU the matting loop could use).
+            if self._preview_imgtk is not None and \
+                    (self._preview_imgtk.width(), self._preview_imgtk.height()) == pic.size:
+                self._preview_imgtk.paste(pic)
+            else:
+                self._preview_imgtk = ImageTk.PhotoImage(pic)
+                self.preview.config(image=self._preview_imgtk, text="")
 
         self.root.after(40, self._tick)
 
@@ -1210,8 +1213,14 @@ def _selftest() -> int:
     lines, ok = [], True
     try:
         eng = vcam.RvmEngine(640, 480)
-        a, fg = eng.process((np.random.rand(480, 640, 3) * 255).astype("uint8"))
+        for _ in range(3):   # a few frames, so a staged pipeline is exercised end to end
+            a, fg = eng.process((np.random.rand(480, 640, 3) * 255).astype("uint8"))
         lines.append(f"RVM OK: alpha{a.shape} fg{fg.shape} dsr={eng.dsr} threads={eng.threads}")
+        lines.append(f"native={vcam.vcam_native is not None} trunk={eng.trunk} "
+                     f"stages={eng._stages is not None} provider={eng.provider}")
+        p = vcam.make_preview(fg, 320, 240)
+        lines.append(f"preview OK: {p.shape}")
+        eng.close()
     except Exception as exc:  # noqa: BLE001
         ok = False
         lines.append(f"RVM FAIL: {exc!r}")

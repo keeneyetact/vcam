@@ -607,6 +607,16 @@ class Compositor:
         return self._out
 
 
+def make_preview(frame_bgr, width, height):
+    """BGR frame -> new RGB array of (height, width) for the GUI preview.
+    (OpenCV's SIMD resize beats a hand-written Rust one here, and releases the
+    GIL too, so there's no native version.)"""
+    h, w = frame_bgr.shape[:2]
+    interp = cv2.INTER_AREA if width < w else cv2.INTER_LINEAR
+    return cv2.cvtColor(cv2.resize(frame_bgr, (width, height), interpolation=interp),
+                        cv2.COLOR_BGR2RGB)
+
+
 class PassthroughCompositor:
     """"Original" mode: send the camera frame untouched (no background effect)."""
 
@@ -1191,6 +1201,10 @@ class VCamWorker:
         self._restart = threading.Event()
         self._lock = threading.Lock()
         self._latest = None          # latest processed BGR frame (for preview)
+        self._preview = None         # it, fitted into preview_box, as RGB
+        # (width, height) the GUI wants the preview to fit, or None for no
+        # preview (e.g. while minimized). Set from the GUI thread.
+        self.preview_box = None
         self._bg_dirty = False
         self._bg_gen = 0             # bumps per background change; stale loads are dropped
         self._pending = None         # compositor finished by a loader thread
@@ -1240,6 +1254,13 @@ class VCamWorker:
     def latest_frame(self):
         with self._lock:
             return None if self._latest is None else self._latest.copy()
+
+    def latest_preview(self):
+        """Latest output frame as an RGB array fitted into `preview_box`, or
+        None. A fresh array per frame that nothing writes to again, so the GUI
+        can use it without copying."""
+        with self._lock:
+            return self._preview
 
     def start(self):
         if self.running:
@@ -1302,8 +1323,19 @@ class VCamWorker:
         threading.Thread(target=work, daemon=True).start()
 
     def _store_latest(self, out):
+        # Runs on the output thread: build the GUI preview here (resized to the
+        # box the GUI asked for, RGB) so the Tk thread only has to display it.
+        box = self.preview_box
+        preview = None
+        if box is not None:
+            h, w = out.shape[:2]
+            k = min(box[0] / w, box[1] / h)
+            tw, th = int(w * k), int(h * k)
+            if tw > 2 and th > 2:
+                preview = make_preview(out, tw, th)
         with self._lock:
             self._latest = out
+            self._preview = preview
 
     def _loop(self):
         # Outer loop: a session runs until stop or until a pipeline-shape change
@@ -1321,7 +1353,7 @@ class VCamWorker:
             self.running = False
             self.device = None
             with self._lock:
-                self._latest = None
+                self._latest = self._preview = None
             if self.status != "error":
                 self.status = "stopped"
 

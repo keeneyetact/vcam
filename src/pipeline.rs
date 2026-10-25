@@ -56,6 +56,9 @@ impl OutputPipeline {
                         None => (job.frame, None),
                     };
                     let mut out = job.compositor.render(frame, alpha.as_deref());
+                    if let Some(a) = alpha {
+                        imgproc::FLOATS.give(a);
+                    }
                     if let Some((w, h)) = job.upscale.filter(|&s| s != out.size()) {
                         // Cover-fit: crops rather than stretches if the camera
                         // couldn't deliver the output's aspect ratio.

@@ -218,7 +218,7 @@ impl Camera {
 
     unsafe fn copy_out(&self, buf: &IMFMediaBuffer) -> Result<Frame> {
         let (w, h) = (self.w, self.h);
-        let mut frame = Frame::new(w, h);
+        let mut frame = Frame::scratch(w, h);
         let mut convert = |scan0: *const u8, pitch: isize| {
             for y in 0..h {
                 let row = std::slice::from_raw_parts(scan0.offset(y as isize * pitch), w * 4);

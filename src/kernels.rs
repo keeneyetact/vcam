@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
-use crate::imgproc::{reflect101, Frame};
+use crate::imgproc::{reflect101, Frame, BYTES, FLOATS, U32S};
 
 const INV255: f32 = 1.0 / 255.0;
 
@@ -75,7 +75,7 @@ fn unit_to_u8(v: f32) -> u8 {
 /// RVM foreground float32 (1,3,H,W) RGB in [0,1] -> BGR frame.
 pub fn fgr_to_bgr(fgr: &[f32], h: usize, w: usize) -> Frame {
     assert_eq!(fgr.len(), 3 * h * w, "fgr must be (1, 3, H, W)");
-    let mut out = Frame::new(w, h);
+    let mut out = Frame::scratch(w, h);
     let (r, gb) = fgr.split_at(h * w);
     let (g, b) = gb.split_at(h * w);
     pool().install(|| {
@@ -121,8 +121,8 @@ pub fn guided_upsample(a: &[f32], b: &[f32], ch: usize, cw: usize, frame: &Frame
     let (h, w) = (frame.h, frame.w);
     assert!(ch > 0 && cw > 0 && a.len() == 4 * ch * cw && b.len() == a.len(),
             "a and b must be (1, 4, h, w)");
-    let mut alpha = vec![0f32; h * w];
-    let mut fg = Frame::new(w, h);
+    let mut alpha = FLOATS.scratch(h * w);
+    let mut fg = Frame::scratch(w, h);
     let cols: Vec<(usize, usize, f32)> = (0..w).map(|x| resize_coord(x, w, cw)).collect();
     let plane = ch * cw;
     pool().install(|| {
@@ -132,34 +132,35 @@ pub fn guided_upsample(a: &[f32], b: &[f32], ch: usize, cw: usize, frame: &Frame
             .zip(frame.data.par_chunks(w * 3))
             .enumerate()
             .for_each_init(
-                || vec![0f32; 8 * cw],
+                || vec![[0f32; 8]; cw],
                 |rows, (y, ((arow, frow_out), frow))| {
                     // Vertical pass: blend the two coarse rows of all 8
-                    // coefficient planes once per output row.
+                    // coefficient planes once per output row, interleaved so a
+                    // pixel's 8 coefficients are one contiguous read.
                     let (y0, y1, dy) = resize_coord(y, h, ch);
                     for c in 0..8 {
                         let src = if c < 4 { a } else { b };
                         let p = &src[(c % 4) * plane..];
                         let (r0, r1) = (&p[y0 * cw..][..cw], &p[y1 * cw..][..cw]);
-                        for (d, (&u, &v)) in rows[c * cw..][..cw].iter_mut().zip(r0.iter().zip(r1)) {
-                            *d = u * (1.0 - dy) + v * dy;
+                        for (d, (&u, &v)) in rows.iter_mut().zip(r0.iter().zip(r1)) {
+                            d[c] = u * (1.0 - dy) + v * dy;
                         }
                     }
                     // Horizontal pass + guided-filter apply, per pixel.
-                    for (x, &(x0, x1, dx)) in cols.iter().enumerate() {
-                        let up = |c: usize| {
-                            let r = &rows[c * cw..];
-                            r[x0] * (1.0 - dx) + r[x1] * dx
-                        };
-                        let px = &frow[x * 3..x * 3 + 3];
+                    let px = frow.chunks_exact(3).zip(frow_out.chunks_exact_mut(3)).zip(arow.iter_mut());
+                    for (((px, out), al), &(x0, x1, dx)) in px.zip(&cols) {
+                        let (r0, r1) = (&rows[x0], &rows[x1]);
+                        let mut up = [0f32; 8];
+                        for c in 0..8 {
+                            up[c] = r0[c] * (1.0 - dx) + r1[c] * dx;
+                        }
                         let rgb = [px[2] as f32 * INV255, px[1] as f32 * INV255, px[0] as f32 * INV255];
                         let mean = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
-                        let out = &mut frow_out[x * 3..x * 3 + 3];
                         for c in 0..3 {
-                            let v = (up(c) * rgb[c] + up(4 + c) + rgb[c]).clamp(0.0, 1.0);
+                            let v = (up[c] * rgb[c] + up[4 + c] + rgb[c]).clamp(0.0, 1.0);
                             out[2 - c] = unit_to_u8(v); // RGB -> BGR
                         }
-                        arow[x] = (up(3) * mean + up(7)).clamp(0.0, 1.0);
+                        *al = (up[3] * mean + up[7]).clamp(0.0, 1.0);
                     }
                 },
             );
@@ -194,7 +195,7 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
     if sh == 0 || sw == 0 {
         return;
     }
-    let mut bin = vec![0u8; sh * sw];
+    let mut bin = BYTES.scratch(sh * sw);
     {
         let a: &[f32] = a;
         pool().install(|| {
@@ -214,64 +215,61 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
         });
     }
 
-    // 8-connected components, union-find. The smaller provisional label always
-    // wins a merge, so each root is the component's first pixel in raster order
-    // -- the same order cv2.connectedComponents numbers them in, which keeps the
-    // tie-break ("first largest") identical.
-    let mut labels = vec![0u32; sh * sw];
-    let mut parent: Vec<u32> = vec![0];
+    // Horizontal runs of foreground, in raster order; row y's runs are
+    // runs[row_at[y]..row_at[y + 1]]. A person blob is a run or two per row, so
+    // labelling runs instead of pixels makes the serial part tiny.
+    let mut runs: Vec<(u32, u32)> = Vec::new(); // (start, end exclusive)
+    let mut row_at = vec![0usize; sh + 1];
     for y in 0..sh {
-        for x in 0..sw {
-            let i = y * sw + x;
-            if bin[i] == 0 {
-                continue;
+        let row = &bin[y * sw..][..sw];
+        let mut x = 0;
+        while x < sw {
+            match row[x..].iter().position(|&v| v != 0) {
+                None => break,
+                Some(d) => x += d,
             }
-            let mut nb = [0u32; 4];
-            let mut k = 0;
-            let mut push = |l: u32| {
-                if l != 0 {
-                    nb[k] = l;
-                    k += 1;
-                }
-            };
-            if x > 0 {
-                push(labels[i - 1]);
+            let s = x;
+            x += row[x..].iter().position(|&v| v == 0).unwrap_or(sw - x);
+            runs.push((s as u32, x as u32));
+        }
+        row_at[y + 1] = runs.len();
+    }
+    BYTES.give(bin);
+    if runs.is_empty() {
+        return; // nothing detected; leave the matte as-is
+    }
+
+    // 8-connected components over the runs, union-find: runs in adjacent rows
+    // touch when their spans, widened by one pixel, overlap. The smaller run
+    // index always wins a merge, so each root is the component's first pixel in
+    // raster order -- the same order cv2.connectedComponents numbers them in,
+    // which keeps the tie-break ("first largest") identical.
+    let mut parent: Vec<u32> = (0..runs.len() as u32).collect();
+    for y in 1..sh {
+        let (prev, cur) = (row_at[y - 1]..row_at[y], row_at[y]..row_at[y + 1]);
+        let mut j = prev.start;
+        for i in cur {
+            let (s, e) = runs[i];
+            // Skip runs above that end left of this one; they can't touch the
+            // later runs in this row either.
+            while j < prev.end && runs[j].1 < s {
+                j += 1;
             }
-            if y > 0 {
-                let up = i - sw;
-                if x > 0 {
-                    push(labels[up - 1]);
+            let mut k = j;
+            while k < prev.end && runs[k].0 <= e {
+                let (a, b) = (find(&mut parent, i as u32), find(&mut parent, k as u32));
+                if a != b {
+                    parent[a.max(b) as usize] = a.min(b);
                 }
-                push(labels[up]);
-                if x + 1 < sw {
-                    push(labels[up + 1]);
-                }
-            }
-            if k == 0 {
-                let l = parent.len() as u32;
-                parent.push(l);
-                labels[i] = l;
-            } else {
-                let mut root = find(&mut parent, nb[0]);
-                for &n in &nb[1..k] {
-                    let r = find(&mut parent, n);
-                    if r != root {
-                        let (lo, hi) = (root.min(r), root.max(r));
-                        parent[hi as usize] = lo;
-                        root = lo;
-                    }
-                }
-                labels[i] = root;
+                k += 1;
             }
         }
     }
-    if parent.len() == 1 {
-        return; // nothing detected; leave the matte as-is
-    }
-    let mut area = vec![0u32; parent.len()];
-    for l in labels.iter_mut().filter(|l| **l != 0) {
-        *l = find(&mut parent, *l);
-        area[*l as usize] += 1;
+    let mut area = vec![0u32; runs.len()];
+    for (i, &(s, e)) in runs.iter().enumerate() {
+        let r = find(&mut parent, i as u32);
+        parent[i] = r;
+        area[r as usize] += e - s;
     }
     let mut biggest = 0usize;
     for (l, &n) in area.iter().enumerate().skip(1) {
@@ -279,30 +277,42 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
             biggest = l;
         }
     }
-    let biggest = biggest as u32;
+    let kept = |i: usize| parent[i] as usize == biggest;
 
-    // Per-row prefix counts of the kept blob, so the 11x11 elliptical dilation
-    // is 11 O(1) span tests per pixel instead of ~100 neighbour reads. Also note
-    // the blob's bounding box: nothing outside it (+5 px of dilation) survives.
-    let pw = sw + 1;
-    let mut pre = vec![0u32; sh * pw];
+    // The blob's bounding box: nothing outside it (+5 px of dilation) survives.
     let (mut x0, mut x1, mut y0, mut y1) = (sw, 0, sh, 0);
     for y in 0..sh {
-        let mut acc = 0;
-        for x in 0..sw {
-            let hit = labels[y * sw + x] == biggest;
-            if hit {
-                (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
-            }
-            acc += hit as u32;
-            pre[y * pw + x + 1] = acc;
+        for i in (row_at[y]..row_at[y + 1]).filter(|&i| kept(i)) {
+            let (s, e) = runs[i];
+            (x0, x1, y0, y1) = (x0.min(s as usize), x1.max(e as usize - 1), y0.min(y), y1.max(y));
         }
     }
     let (x0, x1) = (x0.saturating_sub(5), (x1 + 6).min(sw));
     let (y0, y1) = (y0.saturating_sub(5), (y1 + 6).min(sh));
 
+    // Per-row prefix counts of the kept blob, so the 11x11 elliptical dilation
+    // is 11 O(1) span tests per pixel instead of ~100 neighbour reads.
+    let pw = sw + 1;
+    let mut pre = U32S.scratch(sh * pw);
+    pool().install(|| {
+        pre.par_chunks_mut(pw).enumerate().for_each(|(y, p)| {
+            p[0] = 0;
+            let (mut acc, mut x) = (0u32, 0usize);
+            for i in (row_at[y]..row_at[y + 1]).filter(|&i| kept(i)) {
+                let (s, e) = (runs[i].0 as usize, runs[i].1 as usize);
+                p[x + 1..=s].fill(acc);
+                for v in &mut p[s + 1..=e] {
+                    acc += 1;
+                    *v = acc;
+                }
+                x = e;
+            }
+            p[x + 1..].fill(acc);
+        });
+    });
+
     // The dilated blob at low resolution, one row per task.
-    let mut keep = vec![0u8; sh * sw];
+    let mut keep = BYTES.zeroed(sh * sw);
     pool().install(|| {
         keep.par_chunks_mut(sw).enumerate().for_each(|(sy, krow)| {
             if sy < y0 || sy >= y1 {
@@ -320,19 +330,22 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
             }
         });
     });
+    U32S.give(pre);
 
     // Zero the matte outside the dilated blob, mapping each full-res pixel to its
     // nearest low-res one (INTER_NEAREST upscale).
+    let xmap: Vec<usize> = (0..w).map(|xx| xx * sw / w).collect();
     pool().install(|| {
         a.par_chunks_mut(w).enumerate().for_each(|(yy, row)| {
             let krow = &keep[(yy * sh / h) * sw..][..sw];
-            for (xx, v) in row.iter_mut().enumerate() {
-                if krow[xx * sw / w] == 0 {
+            for (v, &sx) in row.iter_mut().zip(&xmap) {
+                if krow[sx] == 0 {
                     *v = 0.0;
                 }
             }
         });
     });
+    BYTES.give(keep);
 }
 
 // --------------------------------------------------------------------------- //
@@ -369,12 +382,12 @@ pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
     assert!(ksize % 2 == 1, "ksize must be odd");
     let kern = gaussian_kernel(ksize);
     let r = (ksize / 2) as isize;
-    let mut out = Frame::new(w, h);
+    let mut out = Frame::scratch(w, h);
+    let mut tmp = FLOATS.scratch(h * w);
 
     pool().install(|| {
         // Pass 1: matte -> u8 levels, horizontal blur into a float buffer.
         // (The kernels are dyadic fractions, so these sums are exact.)
-        let mut tmp = vec![0f32; h * w];
         tmp.par_chunks_mut(w).zip(alpha.par_chunks(w)).for_each_init(
             || vec![0f32; w],
             |u, (t, arow)| {
@@ -404,28 +417,33 @@ pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
             .zip(bg.data.par_chunks(w * 3))
             .enumerate()
             .for_each_init(
-                || vec![0f32; w],
-                |acc, (y, ((orow, frow), brow))| {
-                    acc.iter_mut().for_each(|v| *v = 0.0);
+                || (vec![0f32; w], vec![0f32; w * 3]),
+                |(acc, wide), (y, ((orow, frow), brow))| {
+                    acc.fill(0.0);
                     for (j, &k) in kern.iter().enumerate() {
                         let src = reflect101(y as isize - r + j as isize, h);
                         for (v, &t) in acc.iter_mut().zip(&tmp[src * w..(src + 1) * w]) {
                             *v += k * t;
                         }
                     }
-                    for x in 0..w {
+                    // The feathered alpha, repeated per channel so the blend is
+                    // one flat (vectorizable) loop over the row's bytes.
+                    for (e, &v) in wide.chunks_exact_mut(3).zip(acc.iter()) {
                         // Round half up, like OpenCV's fixed-point 8-bit blur.
-                        let a = (acc[x] + 0.5).floor().min(255.0) * INV255;
-                        for c in 0..3 {
-                            let i = x * 3 + c;
-                            let (fv, bv) = (frow[i] as i32, brow[i] as i32);
-                            let d = rte((fv - bv) as f32 * a) as i32;
-                            orow[i] = (bv + d).clamp(0, 255) as u8;
-                        }
+                        // v >= 0, so truncation is floor (f32::floor is a libm
+                        // call on baseline x86-64).
+                        e.fill((((v + 0.5) as i32) as f32).min(255.0) * INV255);
+                    }
+                    // Everything but the scaled difference is a small integer,
+                    // so this float math matches the integer blend exactly.
+                    for (((o, &f), &b), &a) in orow.iter_mut().zip(frow).zip(brow).zip(wide.iter()) {
+                        let (fv, bv) = (f as f32, b as f32);
+                        *o = (bv + rte((fv - bv) * a)).clamp(0.0, 255.0) as u8;
                     }
                 },
             );
     });
+    FLOATS.give(tmp);
     out
 }
 
@@ -450,6 +468,69 @@ mod tests {
         keep_largest(&mut a, h, w);
         assert_eq!(a[20 * w + 20], 1.0);
         assert_eq!(a[12 * w + 52], 0.0);
+    }
+
+    /// Pixel-by-pixel reference: 8-connected flood fill in raster order, keep
+    /// the first largest component, dilate it with the 11x11 ellipse.
+    fn keep_largest_reference(a: &mut [f32], h: usize, w: usize) {
+        let mut label = vec![0usize; h * w];
+        let mut areas = vec![0usize];
+        for start in 0..h * w {
+            if a[start] <= 0.5 || label[start] != 0 {
+                continue;
+            }
+            let l = areas.len();
+            let (mut stack, mut n) = (vec![start], 0);
+            label[start] = l;
+            while let Some(i) = stack.pop() {
+                n += 1;
+                let (y, x) = ((i / w) as isize, (i % w) as isize);
+                for (dy, dx) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dy, dx))) {
+                    let (ny, nx) = (y + dy, x + dx);
+                    if ny < 0 || nx < 0 || ny >= h as isize || nx >= w as isize {
+                        continue;
+                    }
+                    let j = ny as usize * w + nx as usize;
+                    if a[j] > 0.5 && label[j] == 0 {
+                        label[j] = l;
+                        stack.push(j);
+                    }
+                }
+            }
+            areas.push(n);
+        }
+        if areas.len() == 1 {
+            return;
+        }
+        let best = (1..areas.len()).fold(1, |b, l| if areas[l] > areas[b] { l } else { b });
+        for y in 0..h {
+            for x in 0..w {
+                let near = ELLIPSE11.iter().enumerate().any(|(j, &hw)| {
+                    let yy = y as isize + j as isize - 5;
+                    (0..h as isize).contains(&yy)
+                        && (x.saturating_sub(hw)..=(x + hw).min(w - 1)).any(|xx| label[yy as usize * w + xx] == best)
+                });
+                if !near {
+                    a[y * w + x] = 0.0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keep_largest_matches_pixel_labelling() {
+        let mut seed = 1u32;
+        for (h, w, density) in [(37, 53, 0.45), (64, 64, 0.6), (40, 90, 0.3), (1, 30, 0.5), (25, 1, 0.5)] {
+            let mut a = vec![0f32; h * w];
+            for v in &mut a {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = if ((seed >> 8) as f32 / (1u32 << 24) as f32) < density { 0.9 } else { 0.1 };
+            }
+            let mut expect = a.clone();
+            keep_largest_reference(&mut expect, h, w);
+            keep_largest(&mut a, h, w);
+            assert_eq!(a, expect, "{h}x{w} @ {density}");
+        }
     }
 
     #[test]

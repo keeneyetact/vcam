@@ -1,0 +1,53 @@
+[package]
+name = "vcam"
+version = "0.2.0"
+edition = "2021"
+description = "Real-time webcam virtual background, published as a system virtual camera"
+publish = false
+default-run = "vcam"
+
+[[bin]]
+name = "vcam"
+path = "src/main.rs"
+
+[[bin]]
+name = "vcam-cli"
+path = "src/bin/vcam-cli.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+minifb = "0.29"
+# ONNX Runtime, CPU build, linked statically (no DLL next to the exe).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-24"] }
+rayon = "1.10"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

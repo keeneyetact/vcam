@@ -1,27 +1,24 @@
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-.venv-build/
-venv/
-env/
+# Rust build output
+/target/
 
-# Downloaded model weights (fetched automatically on first run)
+# Downloaded / generated model weights (fetched or built automatically; a
+# models/rvm_mobilenetv3_fp32.onnx present at build time is bundled into the exe)
 models/*.tflite
 models/*.onnx
 
 # Local backgrounds / scratch
 backgrounds/*.local.*
 *.log
+vcam_selftest.txt
 
 # Personal local files (per-user background pic, launcher script)
 /2.png
 /start.cmd
 
-# Rust build output for the native kernels
-native/target/
-
-# PyInstaller build output (keep vcam.spec; ignore the artifacts)
-build/
-dist/
-*.exe
+# Leftovers from the former Python build
+__pycache__/
+.venv/
+.venv-build/
+/build/
+/dist/
+/native/

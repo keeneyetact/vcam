@@ -765,6 +765,46 @@ impl App {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
+    /// Full-width slider in the app's palette: a rail filled in the accent up to
+    /// the value and a round knob. (egui's own draws its rail in the widget fill,
+    /// which is the panel colour here, so only the knob showed.) Drag or click
+    /// to set; arrow keys step it once focused.
+    fn slider(ui: &mut egui::Ui, p: &Palette, value: &mut f32, lo: f32, hi: f32) -> Response {
+        let knob = 8.0;
+        let (rect, mut resp) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0 * knob + 6.0), Sense::click_and_drag());
+        let (x0, x1) = (rect.left() + knob, rect.right() - knob);
+        let before = *value;
+        if let Some(pos) = resp.interact_pointer_pos() {
+            *value = lo + ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * (hi - lo);
+        }
+        if resp.has_focus() {
+            let step = (hi - lo) / 20.0;
+            ui.input(|i| {
+                if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowDown) {
+                    *value -= step;
+                }
+                if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowUp) {
+                    *value += step;
+                }
+            });
+        }
+        *value = value.clamp(lo, hi);
+        if *value != before {
+            resp.mark_changed();
+        }
+
+        let hot = resp.hovered() || resp.dragged() || resp.has_focus();
+        let cx = x0 + (*value - lo) / (hi - lo) * (x1 - x0);
+        let cy = rect.center().y;
+        let painter = ui.painter();
+        let rail = Rect::from_min_max(pos2(x0, cy - 2.0), pos2(x1, cy + 2.0));
+        painter.rect_filled(rail, 2.0, p.border);
+        painter.rect_filled(Rect::from_min_max(rail.min, pos2(cx, rail.max.y)), 2.0, p.accent);
+        let fill = if resp.dragged() { p.tile_sel } else { p.surface };
+        painter.circle(pos2(cx, cy), if hot { knob } else { knob - 1.0 }, fill, Stroke::new(2.0, p.accent));
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
     /// A selectable card: optional thumbnail above a label.
     fn tile(ui: &mut egui::Ui, p: &Palette, width: f32, tex: Option<&TextureHandle>, img: Vec2, label: &str,
             selected: bool) -> Response {
@@ -935,11 +975,11 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Blur amount");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{:.2}×", self.blur)).size(12.0).color(p.muted));
+                    let pct = (self.blur - BLUR_MIN) / (BLUR_MAX - BLUR_MIN) * 100.0;
+                    ui.label(RichText::new(format!("{pct:.0}%")).size(12.0).color(p.muted));
                 });
             });
-            ui.spacing_mut().slider_width = full;
-            let r = ui.add(egui::Slider::new(&mut self.blur, BLUR_MIN..=BLUR_MAX).show_value(false));
+            let r = Self::slider(ui, p, &mut self.blur, BLUR_MIN, BLUR_MAX);
             if r.changed() {
                 // Live: rebuilds the compositor with the new sigma, no reconnect.
                 self.worker.set_blur_strength(self.blur);

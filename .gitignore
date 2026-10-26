@@ -5,6 +5,7 @@
 # models/rvm_mobilenetv3_fp32.onnx present at build time is bundled into the exe)
 models/*.tflite
 models/*.onnx
+models/_unused/
 
 # Local backgrounds / scratch
 backgrounds/*.local.*

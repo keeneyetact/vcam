@@ -61,7 +61,7 @@ const MODES: [(BgMode, &str, &str); 4] = [
     (BgMode::None, "none", "Original"),
     (BgMode::Blur, "blur", "Blur"),
     (BgMode::Image, "image", "Image"),
-    (BgMode::Color, "color", "Green screen"),
+    (BgMode::Color, "color", "Green"),
 ];
 
 /// Thumbnail pixel sizes (drawn at 2x for high-DPI screens).
@@ -487,6 +487,12 @@ impl App {
         else {
             return false;
         };
+        self.import_images(ctx, &picked)
+    }
+
+    /// Copy pictures (picked or dropped onto the window) into the library and
+    /// use the last one.
+    fn import_images(&mut self, ctx: &egui::Context, picked: &[PathBuf]) -> bool {
         let added: Vec<PathBuf> = picked.iter().filter_map(|p| library::import_image(p)).collect();
         if added.len() < picked.len() {
             message(
@@ -619,6 +625,11 @@ impl App {
             self.side_open = !self.side_open;
             self.schedule_save();
         }
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if !dropped.is_empty() {
+            self.import_images(ctx, &dropped);
+        }
 
         if let Some((_, rx)) = &self.vc_job {
             if let Ok((ok, msg)) = rx.try_recv() {
@@ -695,7 +706,7 @@ impl App {
     fn paint_preview(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let p = self.pal();
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 4.0, p.preview);
+        painter.rect_filled(rect, 8.0, p.preview);
         let ppp = ui.ctx().pixels_per_point();
         self.worker.set_preview_box(Some(((rect.width() * ppp) as usize, (rect.height() * ppp) as usize)));
 
@@ -703,25 +714,10 @@ impl App {
         let tex = self.preview_tex.as_ref().filter(|_| state == Status::Running);
         if let Some(t) = tex {
             let size = t.size_vec2() / ppp;
-            painter.image(t.id(), Rect::from_center_size(rect.center(), size),
-                          Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            egui::Image::from_texture(t).corner_radius(8).paint_at(ui, Rect::from_center_size(rect.center(), size));
         } else {
-            let text = if state == Status::Starting {
-                "Starting your camera…\nThe first start can take a few seconds.".to_string()
-            } else {
-                let hint = if self.side_open {
-                    "Press Start camera (Ctrl+Enter) to see your preview"
-                } else {
-                    "Press Ctrl+Enter to start, or Show controls below"
-                };
-                format!("Your camera is off\n\n{hint}")
-            };
-            let mut job = egui::text::LayoutJob::simple(text, FontId::proportional(16.0), p.preview_text,
-                                                        rect.width() - 40.0);
-            job.halign = Align::Center;
-            let galley = painter.layout_job(job);
-            let origin = rect.center() - galley.rect.center().to_vec2();
-            painter.galley(origin, galley, p.preview_text);
+            // Running but no frame yet still reads as starting.
+            self.paint_empty_preview(ui, rect, if state == Status::Running { Status::Starting } else { state });
         }
 
         // Status pill (top-left).
@@ -753,6 +749,64 @@ impl App {
         }
     }
 
+    /// The preview while there's no video: what's happening, and the one
+    /// thing to do next (a Start / Try again button right where you look).
+    fn paint_empty_preview(&mut self, ui: &mut egui::Ui, rect: Rect, state: Status) {
+        let p = self.pal();
+        let painter = ui.painter_at(rect);
+        let (head, sub, button) = match state {
+            Status::Starting => ("Starting your camera…", "The first start can take a few seconds.", None),
+            Status::Error => ("Your camera stopped", "See the message below for what to do.", Some("Try again")),
+            _ => ("Your camera is off", "Start it to see your preview and go live in your call.", Some("Start camera")),
+        };
+        let bright = Color32::from_gray(232);
+        let mut y = rect.center().y - if button.is_some() { 92.0 } else { 56.0 };
+        let cx = rect.center().x;
+
+        // Icon: a spinner while starting, else a camera (crossed out when off).
+        let icon = Rect::from_center_size(pos2(cx, y + 18.0), vec2(56.0, 36.0));
+        if state == Status::Starting {
+            egui::Spinner::new().size(32.0).color(p.preview_text).paint_at(ui, icon);
+        } else {
+            let stroke = Stroke::new(2.0, p.preview_text);
+            let body = Rect::from_min_max(icon.min + vec2(2.0, 4.0), pos2(icon.left() + 38.0, icon.bottom() - 4.0));
+            painter.rect_stroke(body, 6.0, stroke, StrokeKind::Middle);
+            let (lx, ly) = (body.right() + 4.0, body.center().y);
+            painter.add(egui::Shape::convex_polygon(
+                vec![pos2(lx, ly - 4.0), pos2(lx + 12.0, ly - 10.0), pos2(lx + 12.0, ly + 10.0), pos2(lx, ly + 4.0)],
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+            let (a, b) = (icon.left_top() + vec2(4.0, -2.0), icon.right_bottom() - vec2(4.0, -2.0));
+            painter.line_segment([a, b], Stroke::new(6.0, p.preview));
+            painter.line_segment([a, b], stroke);
+        }
+        y += 36.0 + 18.0;
+
+        let wrap = (rect.width() - 48.0).max(120.0);
+        let g = painter.layout(head.into(), semi(19.0), bright, wrap);
+        painter.galley(pos2(cx - g.size().x / 2.0, y), g.clone(), bright);
+        y += g.size().y + 6.0;
+        let g = painter.layout(sub.into(), FontId::proportional(13.5), p.preview_text, wrap);
+        painter.galley(pos2(cx - g.size().x / 2.0, y), g.clone(), p.preview_text);
+        y += g.size().y + 22.0;
+
+        if let Some(label) = button {
+            let r = Rect::from_center_size(pos2(cx, y + 20.0), vec2(180.0, 40.0));
+            let resp = ui.interact(r, ui.make_persistent_id("preview_start"), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+            let fill = if resp.hovered() { p.accent_hover } else { p.accent };
+            painter.rect_filled(r, 6.0, fill);
+            painter.text(r.center(), Align2::CENTER_CENTER, label, semi(15.0), p.on_accent);
+            Self::focus_ring(ui, p, &resp, r, 6.0);
+            let hint = painter.layout_no_wrap("or press Ctrl+Enter".into(), FontId::proportional(12.0), p.preview_text);
+            painter.galley(pos2(cx - hint.size().x / 2.0, r.bottom() + 10.0), hint, p.preview_text);
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.toggle(ui.ctx());
+            }
+        }
+    }
+
     fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
         ui.add_space(14.0);
         ui.label(RichText::new(title).font(semi(12.0)).color(p.muted));
@@ -764,12 +818,49 @@ impl App {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
-    /// Full-width filled action button (Start / Stop).
-    fn big_button(ui: &mut egui::Ui, text: &str, fill: Color32, hover: Color32, fg: Color32) -> Response {
+    /// Keyboard focus ring around a custom widget (Tab moves between them).
+    fn focus_ring(ui: &egui::Ui, p: &Palette, resp: &Response, rect: Rect, radius: f32) {
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(2.0, p.accent), StrokeKind::Outside);
+        }
+    }
+
+    /// Full-width filled action button (Start / Stop), with its shortcut on
+    /// the right so it's discoverable without hovering.
+    fn big_button(ui: &mut egui::Ui, p: &Palette, text: &str, fill: Color32, hover: Color32) -> Response {
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
         let color = if resp.is_pointer_button_down_on() || resp.hovered() { hover } else { fill };
-        ui.painter().rect_filled(rect, 6.0, color);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, semi(16.0), fg);
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, color);
+        painter.text(rect.center(), Align2::CENTER_CENTER, text, semi(16.0), p.on_accent);
+        painter.text(rect.right_center() - vec2(14.0, 0.0), Align2::RIGHT_CENTER, "Ctrl+Enter",
+                     FontId::proportional(11.5), p.on_accent.gamma_multiply(0.7));
+        Self::focus_ring(ui, p, &resp, rect, 6.0);
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// A full-row on/off switch: label on the left, switch on the right; the
+    /// whole row is clickable (and Space toggles it once focused).
+    fn switch(ui: &mut egui::Ui, p: &Palette, on: &mut bool, label: &str) -> Response {
+        let (rect, mut resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+        if resp.clicked() {
+            *on = !*on;
+            resp.mark_changed();
+        }
+        let value = *on;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, value, label));
+        let t = ui.ctx().animate_bool_responsive(resp.id, value);
+        let track = Rect::from_min_size(pos2(rect.right() - 36.0, rect.center().y - 10.0), vec2(36.0, 20.0));
+        let hot = resp.hovered();
+        let off = if hot { p.muted } else { p.border };
+        let on_fill = if hot { p.accent_hover } else { p.accent };
+        let painter = ui.painter();
+        painter.text(rect.left_center(), Align2::LEFT_CENTER, label, FontId::proportional(13.5), p.text);
+        painter.rect_filled(track, 10.0, if value { on_fill } else { off });
+        let x = egui::lerp(track.left() + 10.0..=track.right() - 10.0, t);
+        painter.circle_filled(pos2(x, track.center().y), 7.0, Color32::WHITE);
+        Self::focus_ring(ui, p, &resp, track, 10.0);
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
@@ -820,22 +911,24 @@ impl App {
         let label_h = 18.0;
         let img_h = if tex.is_some() { img.y + 4.0 } else { 0.0 };
         let (rect, resp) = ui.allocate_exact_size(vec2(width, pad * 2.0 + img_h + label_h), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
         let hovered = resp.hovered();
         let fill = if selected || hovered { p.tile_sel } else { p.tile };
-        let stroke = if selected { p.accent } else if hovered { p.muted } else { p.border };
+        let stroke = if selected { Stroke::new(2.0, p.accent) } else { Stroke::new(1.0, if hovered { p.muted } else { p.border }) };
         let painter = ui.painter();
-        painter.rect(rect, 6.0, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+        painter.rect(rect, 6.0, fill, stroke, StrokeKind::Inside);
         if let Some(t) = tex {
             let r = Rect::from_center_size(pos2(rect.center().x, rect.top() + pad + img.y / 2.0), img);
-            painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            egui::Image::from_texture(t).corner_radius(3).paint_at(ui, r);
         }
-        painter.text(
+        ui.painter().text(
             pos2(rect.center().x, rect.bottom() - pad - label_h / 2.0),
             Align2::CENTER_CENTER,
             label,
-            FontId::proportional(12.5),
+            if selected { semi(12.0) } else { FontId::proportional(12.0) },
             if selected { p.accent } else { p.text },
         );
+        Self::focus_ring(ui, p, &resp, rect, 6.0);
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
@@ -854,6 +947,7 @@ impl App {
                 ui.label(RichText::new("vcam").font(semi(20.0)));
                 let (text, color) = match (&self.busy, self.vc.installed) {
                     (Some(b), _) => (b.clone(), p.muted),
+                    (None, true) if self.worker.running() => ("● Live in Meet, Zoom & Teams".into(), p.danger),
                     (None, true) => ("● Ready for Meet, Zoom & Teams".into(), p.success),
                     (None, false) => ("Virtual camera not set up".into(), p.muted),
                 };
@@ -907,11 +1001,11 @@ impl App {
         ui.add_space(14.0);
         let live = self.worker.running() || self.worker.status() == Status::Starting;
         let resp = if live {
-            Self::big_button(ui, "Stop camera", p.danger, p.danger_hover, p.on_accent)
+            Self::big_button(ui, p, "Stop camera", p.danger, p.danger_hover)
         } else {
-            Self::big_button(ui, "Start camera", p.accent, p.accent_hover, p.on_accent)
+            Self::big_button(ui, p, "Start camera", p.accent, p.accent_hover)
         };
-        if resp.on_hover_text("Ctrl+Enter").clicked() {
+        if resp.clicked() {
             self.toggle(&ctx);
         }
 
@@ -934,8 +1028,8 @@ impl App {
             self.worker.configure(|c| c.camera = self.cam);
             self.schedule_save();
         }
-        if ui
-            .checkbox(&mut self.mirror, "Mirror image")
+        ui.add_space(2.0);
+        if Self::switch(ui, p, &mut self.mirror, "Mirror image")
             .on_hover_text("Flips the video horizontally — for everyone in the call, not just your preview.")
             .changed()
         {
@@ -945,46 +1039,48 @@ impl App {
 
         // Background.
         Self::section(ui, p, "BACKGROUND");
-        let tile_w = (full - 6.0) / 2.0;
-        let img = vec2((tile_w - 14.0).min(120.0), (tile_w - 14.0).min(120.0) * 66.0 / 120.0);
+        // One compact row (like Meet's effects strip), so the picture gallery
+        // below is visible without scrolling.
+        let gap = 6.0;
+        let tile_w = ((full - gap * 3.0) / 4.0).floor();
+        let img = vec2(tile_w - 10.0, ((tile_w - 10.0) * 66.0 / 120.0).round());
         let mut picked = None;
-        for row in 0..2 {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                for col in 0..2 {
-                    let i = row * 2 + col;
-                    let (mode, _, label) = MODES[i];
-                    let mut r = Self::tile(ui, p, tile_w, self.tile_tex.get(i), img, label, self.mode == mode);
-                    r = match mode {
-                        BgMode::None => r.on_hover_text("Your real camera, no background effect."),
-                        BgMode::Color => r.on_hover_text("Solid green — for apps (like OBS) that key it out."),
-                        _ => r,
-                    };
-                    if r.clicked() {
-                        picked = Some(mode);
-                    }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (i, &(mode, _, label)) in MODES.iter().enumerate() {
+                let r = Self::tile(ui, p, tile_w, self.tile_tex.get(i), img, label, self.mode == mode);
+                let r = r.on_hover_text(match mode {
+                    BgMode::None => "Your real camera, no background effect.",
+                    BgMode::Blur => "Blur the room behind you.",
+                    BgMode::Image => "Replace the room with a picture.",
+                    BgMode::Color => "Green screen: solid green, for apps (like OBS) that key it out.",
+                });
+                if r.clicked() {
+                    picked = Some(mode);
                 }
-            });
-        }
+            }
+        });
         if let Some(m) = picked {
             self.mode = m;
             self.apply_bg(&ctx);
         }
 
+        // The picture options go above the gallery, which can grow long.
         if self.mode == BgMode::Image {
             ui.add_space(6.0);
-            self.ui_gallery(ui, &ctx);
-            if ui.checkbox(&mut self.blur_image, "Soften image (out-of-focus look)").changed() {
-                self.apply_bg(&ctx);
-            }
-            if ui
-                .checkbox(&mut self.realistic, "Match my room (realistic)")
+            if Self::switch(ui, p, &mut self.realistic, "Match my room (realistic)")
                 .on_hover_text("Matches the picture to your camera: your room's light and colour, lens focus, \
                                 webcam grain, and light spilling onto your edges.")
                 .changed()
             {
                 self.worker.set_realistic(self.realistic);
                 self.schedule_save();
+            }
+            if Self::switch(ui, p, &mut self.blur_image, "Soften image")
+                .on_hover_text("An out-of-focus look, as if the picture were behind you.")
+                .changed()
+            {
+                self.apply_bg(&ctx);
             }
         }
         if self.mode == BgMode::Blur || (self.mode == BgMode::Image && self.blur_image) {
@@ -1008,6 +1104,10 @@ impl App {
                     ui.label(RichText::new("Strong").size(12.0).color(p.muted));
                 });
             });
+        }
+        if self.mode == BgMode::Image {
+            ui.add_space(10.0);
+            self.ui_gallery(ui, &ctx);
         }
 
         // Advanced (collapsible).
@@ -1038,36 +1138,54 @@ impl App {
                 for i in row * cols..(row * cols + cols).min(n) {
                     let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
                     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                    let painter = ui.painter();
                     let Some(item) = self.gallery.get(i) else {
                         // The trailing "+ Add" cell.
-                        let fill = if resp.hovered() { p.tile_sel } else { p.tile };
-                        painter.rect(rect, 4.0, fill, Stroke::new(1.0, p.border), StrokeKind::Inside);
-                        painter.text(rect.center(), Align2::CENTER_CENTER, "+  Add", semi(12.5), p.accent);
-                        if resp.on_hover_text("Add your own pictures (Ctrl+O)").clicked() {
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Add pictures"));
+                        let hot = resp.hovered();
+                        let painter = ui.painter();
+                        painter.rect(rect, 4.0, if hot { p.tile_sel } else { p.tile },
+                                     Stroke::new(1.0, if hot { p.accent } else { p.border }), StrokeKind::Inside);
+                        painter.text(rect.center() - vec2(0.0, 7.0), Align2::CENTER_CENTER, "+", semi(18.0), p.accent);
+                        painter.text(rect.center() + vec2(0.0, 11.0), Align2::CENTER_CENTER, "Add", semi(11.5), p.accent);
+                        Self::focus_ring(ui, p, &resp, rect, 4.0);
+                        if resp.on_hover_text("Add your own pictures (Ctrl+O), or drag them onto this window").clicked() {
                             add = true;
                         }
                         continue;
                     };
                     let selected = sel.as_deref().is_some_and(|s| library::same_file(s, &item.path));
-                    painter.image(item.tex.id(), rect.shrink(2.0),
-                                  Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    if selected || resp.hovered() {
-                        let c = if selected { p.accent } else { p.muted };
-                        painter.rect_stroke(rect, 4.0, Stroke::new(2.0, c), StrokeKind::Inside);
-                    }
-                    let badge = Rect::from_min_size(pos2(rect.right() - 20.0, rect.top() + 4.0), vec2(16.0, 16.0));
-                    if item.removable {
-                        painter.rect_filled(badge, 3.0, Color32::from_black_alpha(190));
-                        painter.text(badge.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(11.0), Color32::WHITE);
-                    }
-                    let tip = if item.removable {
+                    let name = if item.removable {
                         item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
                     } else {
                         "Built-in background".into()
                     };
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, &name));
+                    egui::Image::from_texture(&item.tex).corner_radius(4).paint_at(ui, rect);
+                    let painter = ui.painter();
+                    if selected {
+                        painter.rect_stroke(rect, 4.0, Stroke::new(2.5, p.accent), StrokeKind::Inside);
+                        // A check mark, so the choice reads without relying on colour.
+                        let c = rect.left_top() + vec2(11.0, 11.0);
+                        painter.circle(c, 7.5, p.accent, Stroke::new(1.5, Color32::WHITE));
+                        painter.line(vec![c + vec2(-3.5, 0.2), c + vec2(-1.0, 2.7), c + vec2(3.5, -2.3)],
+                                     Stroke::new(1.6, Color32::WHITE));
+                    } else if resp.hovered() {
+                        painter.rect_stroke(rect, 4.0, Stroke::new(2.0, p.muted), StrokeKind::Inside);
+                    }
+                    Self::focus_ring(ui, p, &resp, rect, 4.0);
+                    // The remove badge only shows on the picture you're pointing
+                    // at (Delete also removes the focused one).
+                    let badge = Rect::from_min_size(pos2(rect.right() - 21.0, rect.top() + 4.0), vec2(17.0, 17.0));
                     let over_badge = item.removable && resp.hover_pos().is_some_and(|pos| badge.contains(pos));
-                    let resp = resp.on_hover_text(if over_badge { "Remove".to_string() } else { tip });
+                    if item.removable && resp.hovered() {
+                        let fill = if over_badge { p.danger } else { Color32::from_black_alpha(190) };
+                        painter.rect_filled(badge, 4.0, fill);
+                        painter.text(badge.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(11.0), Color32::WHITE);
+                    }
+                    if item.removable && resp.has_focus() && ui.input(|i| i.key_pressed(Key::Delete)) {
+                        remove = Some(item.path.clone());
+                    }
+                    let resp = resp.on_hover_text(if over_badge { "Remove from your backgrounds".to_string() } else { name });
                     if resp.clicked() {
                         if over_badge {
                             remove = Some(item.path.clone());
@@ -1132,18 +1250,17 @@ impl App {
         }
 
         ui.add_space(6.0);
-        if ui
-            .checkbox(&mut self.one_person, "Only show one person")
+        if Self::switch(ui, p, &mut self.one_person, "Only show one person")
             .on_hover_text("Hides people walking behind you. Turn off to keep everyone in frame.")
             .changed()
         {
             self.worker.configure(|c| c.multi_person = !self.one_person);
             self.schedule_save();
         }
-        if ui
-            .checkbox(&mut self.fix_exposure, "Keep full frame rate in dim light")
+        if Self::switch(ui, p, &mut self.fix_exposure, "Keep full frame rate in dim light")
             .on_hover_text(
-                "Fixes your webcam's exposure so it can't slow down to brighten the picture                  (many drop to ~20 fps indoors). Turn off if the image looks too dark.",
+                "Fixes your webcam's exposure so it can't slow down to brighten the picture \
+                 (many drop to ~20 fps indoors). Turn off if the image looks too dark.",
             )
             .changed()
         {
@@ -1224,14 +1341,11 @@ impl eframe::App for App {
                 self.paint_preview(ui, prect);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "In Google Meet, Zoom or Teams, open video settings and choose “{}” as your camera.",
-                            virtualcam::DEVICE_NAME
-                        ))
-                        .size(12.0)
-                        .color(p.muted),
-                    );
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(RichText::new("In Meet, Zoom or Teams, pick ").size(12.0).color(p.muted));
+                    ui.label(RichText::new(virtualcam::DEVICE_NAME).font(semi(12.0)).color(p.text))
+                        .on_hover_text("Video settings → Camera. Leave vcam running while you're in the call.");
+                    ui.label(RichText::new(" as your camera.").size(12.0).color(p.muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let text = if self.side_open { "Hide controls  ▸" } else { "◂  Show controls" };
                         if Self::link(ui, p, text)
@@ -1244,6 +1358,17 @@ impl eframe::App for App {
                     });
                 });
             });
+
+        // Pictures dragged over the window: say what dropping them does.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
+            let r = ctx.content_rect().shrink(10.0);
+            painter.rect(r, 10.0, p.bg.gamma_multiply(0.92), Stroke::new(2.0, p.accent), StrokeKind::Inside);
+            painter.text(r.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to add as a background",
+                         semi(20.0), p.text);
+            painter.text(r.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "PNG, JPG, BMP or WebP",
+                         FontId::proportional(13.0), p.muted);
+        }
 
         // Poll the worker's status (fps, state) a few times a second; new
         // preview frames request their own repaint.

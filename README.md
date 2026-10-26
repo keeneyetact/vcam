@@ -71,9 +71,10 @@ preview front and centre:
 3. **Camera** picker (by device name) and **Mirror image**.
 4. **Background** — Original (no effect), Blur, Image, or Green screen —
    switchable live, with a blur-amount slider. Image opens a gallery: a
-   built-in default plus any pictures you add (**+ Add** or Ctrl+O; copied to
-   `%APPDATA%\vcam\backgrounds`). Click one to use it, ✕ to remove it (your
-   original file is untouched), and optionally soften it. **Match my room
+   built-in default plus any pictures you add (**+ Add**, Ctrl+O, or drag them
+   onto the window; copied to
+   `%APPDATA%\vcam\backgrounds`). Click one to use it, the ✕ that appears on
+   hover (or Delete) to remove it (your original file is untouched), and optionally soften it. **Match my room
    (realistic)**, on by default, makes the picture read as the room the camera
    is filming: its light and colour follow your real room (measured behind
    you every frame), with a slight lens softness, your webcam's own grain, and

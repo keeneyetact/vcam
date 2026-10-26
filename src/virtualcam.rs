@@ -11,13 +11,15 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use windows::core::{w, HSTRING};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, FILE_MAP_READ,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+};
 
 use crate::imgproc::Frame;
 
@@ -188,14 +190,45 @@ fn bgr_to_nv12(f: &Frame, out: &mut [u8]) {
 
 /// CLSID of the OBS Virtual Camera DirectShow filter (stable across OBS 26+).
 pub const OBS_VCAM_CLSID: &str = "{A3FCE0F5-3493-419F-958A-ABA1250EC20B}";
+/// The module DLLs (64- and 32-bit), relative to the OBS Studio folder.
 const OBS_VCAM_DLLS: [&str; 2] = [
-    r"C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll",
-    r"C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module32.dll",
+    r"data\obs-plugins\win-dshow\obs-virtualcam-module64.dll",
+    r"data\obs-plugins\win-dshow\obs-virtualcam-module32.dll",
 ];
 
-/// Existing OBS Virtual Camera module DLL paths (64- and 32-bit).
+/// OBS Studio's install folder as its installer recorded it
+/// (HKLM\SOFTWARE\OBS Studio), so a non-default location is found too.
+fn obs_install_dir() -> Option<PathBuf> {
+    let mut buf = [0u16; 1024];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\OBS Studio"),
+            PCWSTR::null(),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+        .ok()
+        .ok()?;
+    }
+    let s = String::from_utf16_lossy(&buf[..len as usize / 2]);
+    let s = s.trim_end_matches('\0').trim();
+    (!s.is_empty()).then(|| PathBuf::from(s))
+}
+
+/// Existing OBS Virtual Camera module DLL paths (64- and 32-bit), from the
+/// first OBS folder that has them: the registered install, else the default.
 pub fn find_dlls() -> Vec<PathBuf> {
-    OBS_VCAM_DLLS.iter().map(PathBuf::from).filter(|p| p.is_file()).collect()
+    let default = std::env::var_os("ProgramFiles").map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from);
+    obs_install_dir()
+        .into_iter()
+        .chain([default.join("obs-studio")])
+        .map(|dir| OBS_VCAM_DLLS.iter().map(|d| dir.join(d)).filter(|p| p.is_file()).collect::<Vec<_>>())
+        .find(|dlls| !dlls.is_empty())
+        .unwrap_or_default()
 }
 
 /// True if the OBS Virtual Camera DirectShow source is registered system-wide.
@@ -238,7 +271,9 @@ fn run_regsvr(unregister: bool) -> (bool, String) {
     if let Err(e) = std::fs::write(&bat, lines.join("\r\n")) {
         return (false, format!("Could not write the setup script: {e}"));
     }
-    let ps = format!("Start-Process -FilePath '{}' -Verb RunAs -Wait", bat.display());
+    // Single-quoted PowerShell string: a quote in the path (e.g. a user
+    // named O'Brien) is escaped by doubling it.
+    let ps = format!("Start-Process -FilePath '{}' -Verb RunAs -Wait", bat.display().to_string().replace('\'', "''"));
     let run = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
         .creation_flags(CREATE_NO_WINDOW)

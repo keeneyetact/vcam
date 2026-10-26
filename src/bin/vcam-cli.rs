@@ -35,7 +35,7 @@ struct Args {
     #[arg(long, value_name = "R,G,B", value_parser = parse_color)]
     color: Option<[u8; 3]>,
     /// RVM internal downsample_ratio 0-1 (default 0.375; lower = faster, softer hair)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_downsample)]
     downsample: Option<f32>,
     /// CPU threads per RVM stage (default: min(8, cores); more can be slower)
     #[arg(long)]
@@ -91,6 +91,14 @@ fn parse_color(text: &str) -> Result<[u8; 3], String> {
     match v[..] {
         [r, g, b] => Ok([b, g, r]),
         _ => Err("--color must be 'R,G,B', e.g. 0,177,64".into()),
+    }
+}
+
+/// RVM's downsample_ratio must be in (0, 1].
+fn parse_downsample(text: &str) -> Result<f32, String> {
+    match text.trim().parse::<f32>() {
+        Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
+        _ => Err("--downsample must be a number above 0 and at most 1, e.g. 0.375".into()),
     }
 }
 

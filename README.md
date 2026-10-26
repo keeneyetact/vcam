@@ -126,7 +126,7 @@ terminal.
 | `--background, -b PATH` | — | Background image to composite behind you |
 | `--blur` | — | Blur the real background instead of replacing it (default) |
 | `--color R,G,B` | — | Solid color background, e.g. `0,177,64` |
-| `--downsample` | `0.375` | RVM internal ratio 0–1; lower = faster, softer hair |
+| `--downsample` | `0.375` | RVM internal ratio, above 0 and at most 1; lower = faster, softer hair |
 | `--threads` | `min(8,cores)` | CPU threads per RVM stage (more can be slower) |
 | `--camera, -c N` | `0` | Webcam index (see `--list-cameras`) |
 | `--width` / `--height` | `1280` / `720` | **Capture** resolution (what the camera is asked for) |

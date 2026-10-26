@@ -58,6 +58,9 @@ struct Args {
     /// Target frames per second
     #[arg(long, default_value_t = 30)]
     fps: u32,
+    /// Let the webcam's auto-exposure run (default: fix it so dim light can't slow the frame rate)
+    #[arg(long)]
+    auto_exposure: bool,
     /// Keep everyone in frame (default: keep only the single largest person)
     #[arg(long)]
     multi_person: bool,
@@ -132,6 +135,7 @@ fn main() {
         color: args.color.unwrap_or(defaults.color),
         mirror: args.mirror,
         multi_person: args.multi_person,
+        fix_exposure: !args.auto_exposure,
         downsample: args.downsample,
         threads: args.threads,
         virtualcam: if args.no_virtualcam { VirtualCamUse::Off } else { VirtualCamUse::Optional },

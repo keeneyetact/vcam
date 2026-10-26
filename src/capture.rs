@@ -4,6 +4,11 @@
 //! RGB32 for us. Picking the native format matters: many webcams do 1280x720
 //! at only ~10 fps uncompressed but 30 fps as MJPEG, so the format is chosen
 //! for the requested size first and frame rate second.
+//!
+//! Even then, in dim light a webcam's auto-exposure lengthens each exposure
+//! past the frame interval and quietly drops to ~15-20 fps. Optionally the
+//! exposure is pinned to the longest one that still fits a frame (restored when
+//! the camera closes), which holds the full frame rate.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -13,6 +18,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use windows::core::{Interface, GUID, PWSTR};
+use windows::Win32::Media::DirectShow::{
+    CameraControl_Exposure, CameraControl_Flags_Auto, CameraControl_Flags_Manual, IAMCameraControl,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 
@@ -103,6 +111,8 @@ pub struct CameraInfo {
     pub height: usize,
     pub fps: f64,
     pub format: String,
+    /// The pinned exposure, log2 seconds (-5 == 1/32 s); None == the camera's auto.
+    pub exposure: Option<i32>,
 }
 
 fn split_u64(v: u64) -> (u32, u32) {
@@ -118,16 +128,52 @@ fn subtype_name(g: &GUID) -> String {
     }
 }
 
+/// With `fix`, pin the exposure to the longest one that fits a frame at `fps`,
+/// so auto-exposure can't trade frame rate for brightness. Returns the control,
+/// the value set and the (value, flags) to restore; None if not pinned (off, or
+/// the camera has no manual exposure).
+///
+/// The setting lives in the camera, so a session that was killed leaves it
+/// pinned. Manual at exactly our value is taken to be such a leftover: it's
+/// put back to auto rather than kept as "the camera's own" setting.
+unsafe fn pin_exposure(source: &IMFMediaSource, fps: f64, fix: bool) -> Option<(IAMCameraControl, i32, (i32, i32))> {
+    let cc: IAMCameraControl = source.cast().ok()?;
+    let id = CameraControl_Exposure.0;
+    let (mut lo, mut hi, mut step, mut def, mut caps) = (0, 0, 0, 0, 0);
+    cc.GetRange(id, &mut lo, &mut hi, &mut step, &mut def, &mut caps).ok()?;
+    if caps & CameraControl_Flags_Manual.0 == 0 {
+        return None;
+    }
+    let (mut value, mut flags) = (0, 0);
+    cc.Get(id, &mut value, &mut flags).ok()?;
+    // Exposure is in log2 seconds: 2^-5 s = 31 ms is the longest under 33 ms.
+    let v = (-(fps.max(1.0).log2().ceil() as i32)).clamp(lo, hi);
+    let mut orig = (value, flags);
+    if flags == CameraControl_Flags_Manual.0 && value == v && caps & CameraControl_Flags_Auto.0 != 0 {
+        orig = (def, CameraControl_Flags_Auto.0);
+    }
+    if !fix {
+        if orig != (value, flags) {
+            let _ = cc.Set(id, orig.0, orig.1);
+        }
+        return None;
+    }
+    cc.Set(id, v, CameraControl_Flags_Manual.0).ok()?;
+    Some((cc, v, orig))
+}
+
 struct Camera {
     reader: IMFSourceReader,
     source: IMFMediaSource,
+    /// Exposure control + the original (value, flags), restored on drop.
+    exposure: Option<(IAMCameraControl, (i32, i32))>,
     w: usize,
     h: usize,
     stride: i32,
 }
 
 impl Camera {
-    fn open(index: usize, width: usize, height: usize, fps: f64) -> Result<(Self, CameraInfo)> {
+    fn open(index: usize, width: usize, height: usize, fps: f64, fix_exposure: bool) -> Result<(Self, CameraInfo)> {
         let busy = || {
             anyhow!(
                 "Could not open camera {index}. A webcam can only be used by one app at a time; close \
@@ -194,8 +240,17 @@ impl Camera {
             let cur = reader.GetCurrentMediaType(FIRST_VIDEO)?;
             let (w, h) = split_u64(cur.GetUINT64(&MF_MT_FRAME_SIZE)?);
             let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(w as i32 * 4);
-            let info = CameraInfo { name, width: w as usize, height: h as usize, fps: f, format: tag };
-            Ok((Camera { reader, source, w: w as usize, h: h as usize, stride }, info))
+            let pinned = pin_exposure(&source, f, fix_exposure);
+            let info = CameraInfo {
+                name,
+                width: w as usize,
+                height: h as usize,
+                fps: f,
+                format: tag,
+                exposure: pinned.as_ref().map(|p| p.1),
+            };
+            let exposure = pinned.map(|(cc, _, orig)| (cc, orig));
+            Ok((Camera { reader, source, exposure, w: w as usize, h: h as usize, stride }, info))
         }
     }
 
@@ -252,6 +307,10 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         unsafe {
+            // Hand the camera back as we found it (other apps share the setting).
+            if let Some((cc, (value, flags))) = &self.exposure {
+                let _ = cc.Set(CameraControl_Exposure.0, *value, *flags);
+            }
             let _ = self.source.Shutdown();
         }
     }
@@ -274,7 +333,7 @@ pub struct FrameGrabber {
 }
 
 impl FrameGrabber {
-    pub fn start(index: usize, width: usize, height: usize, fps: f64) -> Result<(Self, CameraInfo)> {
+    pub fn start(index: usize, width: usize, height: usize, fps: f64, fix_exposure: bool) -> Result<(Self, CameraInfo)> {
         let shared = Arc::new((Mutex::new(GrabState { frame: None, seq: 0, running: true }), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (info_tx, info_rx) = mpsc::sync_channel::<Result<CameraInfo>>(1);
@@ -284,7 +343,7 @@ impl FrameGrabber {
             let _done = done_tx; // dropped (=> signalled) when this thread ends
             let run = || -> Result<()> {
                 let _mf = MfThread::init()?;
-                let mut cam = match Camera::open(index, width, height, fps) {
+                let mut cam = match Camera::open(index, width, height, fps, fix_exposure) {
                     Ok((cam, info)) => {
                         let _ = info_tx.send(Ok(info));
                         cam

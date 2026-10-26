@@ -127,6 +127,7 @@ terminal.
 | `--out-width` / `--out-height` | = capture | **Output** resolution. Capture small/fast, upscale the result (see Performance) |
 | `--fps` | `30` | Target frame rate |
 | `--mirror` | off | Horizontally flip (selfie view) |
+| `--auto-exposure` | off | Let the webcam's auto-exposure run (it can slow to ~20 fps in dim light; see Performance) |
 | `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
 | `--no-preview` | off | Don't open the preview window |
 | `--no-virtualcam` | off | Preview only; don't open a virtual camera |
@@ -191,9 +192,14 @@ the output is identical to the stock model to within float rounding (see the
 
 **The camera** is a per-device **resolution/fps tradeoff**. vcam asks Media
 Foundation for the camera's fastest format at the requested size, but some
-webcams still do 1280×720 at only ~10–20 fps (dim light lengthens exposure, too
-— add light). For **smooth 30 fps**, capture at a fast resolution and upscale
-the matted output:
+webcams still do 1280×720 at only ~10–20 fps. Dim light is the usual culprit:
+auto-exposure lengthens each exposure past the frame interval. So vcam fixes
+the exposure at the longest that fits a frame (1/32 s at 30 fps) while it owns
+the camera, and restores the camera's own setting afterwards — on a "Full HD
+webcam" that took 720p from 20 to 30 fps. If the picture is too dark, add light
+or turn this off (**Keep full frame rate in dim light** in Advanced settings,
+`--auto-exposure` on the CLI). If the camera itself can't do 30 fps at 720p,
+capture at a fast resolution and upscale the matted output:
 
 ```bash
 vcam-cli --width 640 --height 360 --out-width 1280 --out-height 720

@@ -271,6 +271,7 @@ pub struct App {
     speed: usize,
     quality: usize,
     one_person: bool,
+    fix_exposure: bool,
     adv_open: bool,
     side_open: bool,
 
@@ -359,6 +360,7 @@ impl App {
             speed: SPEED_MODES.iter().position(|m| m.0 == s.speed).unwrap_or(0),
             quality: QUALITY_PRESETS.iter().position(|q| q.0 == s.quality).unwrap_or(QUALITY_DEFAULT),
             one_person: s.one_person,
+            fix_exposure: s.fix_exposure,
             adv_open: s.advanced_open,
             side_open: s.sidebar_open,
             vc: virtualcam::status(),
@@ -408,6 +410,7 @@ impl App {
             speed: SPEED_MODES[self.speed].0.into(),
             quality: QUALITY_PRESETS[self.quality].0.into(),
             one_person: self.one_person,
+            fix_exposure: self.fix_exposure,
             library_migrated: true,
             advanced_open: self.adv_open,
             sidebar_open: self.side_open,
@@ -578,6 +581,7 @@ impl App {
             c.blur_strength = self.blur;
             c.mirror = self.mirror;
             c.multi_person = !self.one_person;
+            c.fix_exposure = self.fix_exposure;
             c.downsample = Some(QUALITY_PRESETS[self.quality].1);
             (c.width, c.height, c.out_width, c.out_height) = (cw, ch, ow, oh);
         });
@@ -1121,6 +1125,17 @@ impl App {
             .changed()
         {
             self.worker.configure(|c| c.multi_person = !self.one_person);
+            self.schedule_save();
+        }
+        if ui
+            .checkbox(&mut self.fix_exposure, "Keep full frame rate in dim light")
+            .on_hover_text(
+                "Fixes your webcam's exposure so it can't slow down to brighten the picture                  (many drop to ~20 fps indoors). Turn off if the image looks too dark.",
+            )
+            .changed()
+        {
+            // Reopens the camera with the new setting.
+            self.worker.configure(|c| c.fix_exposure = self.fix_exposure);
             self.schedule_save();
         }
 

@@ -59,6 +59,9 @@ pub struct Config {
     /// RVM downsample_ratio; None == automatic.
     pub downsample: Option<f32>,
     pub threads: Option<usize>,
+    /// Pin the webcam's exposure so it holds the full frame rate in dim light
+    /// (auto-exposure otherwise slows many webcams to ~20 fps).
+    pub fix_exposure: bool,
     pub virtualcam: VirtualCamUse,
 }
 
@@ -80,6 +83,7 @@ impl Default for Config {
             multi_person: false,
             downsample: None,
             threads: None,
+            fix_exposure: true,
             virtualcam: VirtualCamUse::Required,
         }
     }
@@ -90,7 +94,8 @@ impl Config {
     /// everything else (mirror, downsample, one-person, background) applies
     /// live on the next frame.
     fn restart_key(&self) -> impl PartialEq {
-        (self.camera, self.width, self.height, self.out_width, self.out_height, self.fps, self.threads, self.virtualcam)
+        (self.camera, self.width, self.height, self.out_width, self.out_height, self.fps, self.threads, self.fix_exposure,
+         self.virtualcam)
     }
 }
 
@@ -407,9 +412,12 @@ fn make_engine(cfg: &Config, w: usize, h: usize) -> Result<RvmEngine> {
 
 fn run_session(sh: &Arc<Shared>) -> Result<()> {
     let cfg = sh.cfg.lock().unwrap().clone();
-    let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64)?;
+    let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.fix_exposure)?;
     let (w, h) = (cam_info.width, cam_info.height);
     crate::log!("Capturing {w}x{h} {} @ {:.0} fps from '{}'", cam_info.format, cam_info.fps, cam_info.name);
+    if let Some(e) = cam_info.exposure {
+        crate::log!("Exposure fixed at 1/{} s to hold the frame rate", 1u32 << -e.min(0));
+    }
     let mut engine = make_engine(&cfg, w, h)?;
 
     let bg_cfg = {

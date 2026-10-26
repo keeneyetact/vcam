@@ -268,6 +268,7 @@ pub struct App {
     bg_path: Option<PathBuf>,
     blur_image: bool,
     blur: f32,
+    realistic: bool,
     speed: usize,
     quality: usize,
     one_person: bool,
@@ -357,6 +358,7 @@ impl App {
             bg_path,
             blur_image: s.blur_image,
             blur: s.blur_strength.map_or(BLUR_DEFAULT, |v| (v as f32).clamp(BLUR_MIN, BLUR_MAX)),
+            realistic: s.realistic,
             speed: SPEED_MODES.iter().position(|m| m.0 == s.speed).unwrap_or(0),
             quality: QUALITY_PRESETS.iter().position(|q| q.0 == s.quality).unwrap_or(QUALITY_DEFAULT),
             one_person: s.one_person,
@@ -407,6 +409,7 @@ impl App {
             bg_path: self.bg_path.clone(),
             blur_image: self.blur_image,
             blur_strength: Some(self.blur as f64),
+            realistic: self.realistic,
             speed: SPEED_MODES[self.speed].0.into(),
             quality: QUALITY_PRESETS[self.quality].0.into(),
             one_person: self.one_person,
@@ -579,6 +582,7 @@ impl App {
             c.bg_path = self.bg_path.clone();
             c.blur_image = self.blur_image;
             c.blur_strength = self.blur;
+            c.realistic = self.realistic;
             c.mirror = self.mirror;
             c.multi_person = !self.one_person;
             c.fix_exposure = self.fix_exposure;
@@ -972,6 +976,15 @@ impl App {
             self.ui_gallery(ui, &ctx);
             if ui.checkbox(&mut self.blur_image, "Soften image (out-of-focus look)").changed() {
                 self.apply_bg(&ctx);
+            }
+            if ui
+                .checkbox(&mut self.realistic, "Match my room (realistic)")
+                .on_hover_text("Matches the picture to your camera: your room's light and colour, lens focus, \
+                                webcam grain, and light spilling onto your edges.")
+                .changed()
+            {
+                self.worker.set_realistic(self.realistic);
+                self.schedule_save();
             }
         }
         if self.mode == BgMode::Blur || (self.mode == BgMode::Image && self.blur_image) {

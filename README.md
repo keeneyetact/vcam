@@ -73,7 +73,11 @@ preview front and centre:
    switchable live, with a blur-amount slider. Image opens a gallery: a
    built-in default plus any pictures you add (**+ Add** or Ctrl+O; copied to
    `%APPDATA%\vcam\backgrounds`). Click one to use it, ✕ to remove it (your
-   original file is untouched), and optionally soften it.
+   original file is untouched), and optionally soften it. **Match my room
+   (realistic)**, on by default, makes the picture read as the room the camera
+   is filming: its light and colour follow your real room (measured behind
+   you every frame), with a slight lens softness, your webcam's own grain, and
+   a little of the background's light wrapping onto your edges.
 5. **Advanced settings** — Performance (Sharp 720p / Smooth 30 fps), edge
    detail, only-one-person, and driver reinstall/uninstall.
 
@@ -128,6 +132,7 @@ terminal.
 | `--fps` | `30` | Target frame rate |
 | `--mirror` | off | Horizontally flip (selfie view) |
 | `--auto-exposure` | off | Let the webcam's auto-exposure run (it can slow to ~20 fps in dim light; see Performance) |
+| `--plain` | off | Paste the background picture as-is (default: match it to your room's light, focus and grain) |
 | `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
 | `--no-preview` | off | Don't open the preview window |
 | `--no-virtualcam` | off | Preview only; don't open a virtual camera |
@@ -155,6 +160,7 @@ webcam ─► Media Foundation ─► RVM (3-stage ONNX Runtime pipeline) ─►
 | `rvm` | The 3-stage inference pipeline (one session + thread per stage) and the single-session fallback |
 | `kernels` | Fused per-frame passes: input conversion, RVM's full-resolution guided-filter tail, single-person isolation, feather + blend |
 | `compositor` / `imgproc` | Backgrounds (image cover-fit, blur, colour) and the resize/blur primitives |
+| `look` | The realistic picture look: room light/colour matching, lens softness, webcam grain, light wrap |
 | `pipeline` | Post-processing, compositing and the virtual-camera send on an output thread, overlapping the next inference |
 | `virtualcam` | Writes the OBS Virtual Camera's `OBSVirtualCamVideo` shared-memory queue; registers/unregisters its driver |
 | `worker` | The capture → matte → composite → send loop with live option changes, used by both the GUI and the CLI |

@@ -376,6 +376,61 @@ fn gaussian_kernel(k: usize) -> Vec<f32> {
 /// levels (truncating), Gaussian-feathered with a `ksize` kernel, then the
 /// integer blend -- fused into two passes.
 pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
+    composite_graded(fg, bg, alpha, ksize, None)
+}
+
+/// Matching applied to a picture background as it's blended (see `look`).
+pub struct Grade<'a> {
+    /// Per-channel tone curve for the background.
+    pub lut: &'a [[u8; 256]; 3],
+    /// Grain sigma, in levels, added to the background.
+    pub grain: f32,
+    /// Changes every frame, so the grain moves like sensor noise.
+    pub seed: u32,
+    pub wrap: Option<Wrap<'a>>,
+}
+
+/// Light wrap: background light spilling onto the person's edge.
+pub struct Wrap<'a> {
+    /// Background coverage around each point (blurred 1 - alpha), at the
+    /// size of `light`.
+    pub mask: &'a [f32],
+    /// Blurred background light, small.
+    pub light: &'a Frame,
+    pub strength: f32,
+}
+
+type Taps = Vec<(usize, usize, f32)>;
+
+/// Bilinear taps mapping a full-size axis onto a small grid's.
+fn grid_taps(out_len: usize, in_len: usize) -> Taps {
+    (0..out_len)
+        .map(|o| {
+            let s = ((o as f32 + 0.5) * in_len as f32 / out_len as f32 - 0.5).clamp(0.0, (in_len - 1) as f32);
+            let i0 = s as usize;
+            (i0, (i0 + 1).min(in_len - 1), s - i0 as f32)
+        })
+        .collect()
+}
+
+/// Two zero-mean, unit-variance (triangular) grain values from a pixel hash.
+#[inline]
+fn grain_pair(seed: u32, i: u32) -> (f32, f32) {
+    let mut x = i.wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    // A difference of two uniform bytes has variance ~ 2 * 255^2 / 12.
+    const K: f32 = 2.449_489_8 / 255.0; // sqrt(6) / 255
+    let b = x.to_le_bytes();
+    ((b[0] as f32 - b[1] as f32) * K, (b[2] as f32 - b[3] as f32) * K)
+}
+
+/// `composite`, with the background graded (tone curve + grain) and the
+/// person's edge light-wrapped when `grade` is given.
+pub fn composite_graded(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize, grade: Option<&Grade>) -> Frame {
     let (h, w) = (fg.h, fg.w);
     assert!(bg.size() == fg.size(), "fg and bg must be the same size");
     assert_eq!(alpha.len(), h * w, "alpha must be HxW matching the image");
@@ -384,6 +439,10 @@ pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
     let r = (ksize / 2) as isize;
     let mut out = Frame::scratch(w, h);
     let mut tmp = FLOATS.scratch(h * w);
+    let wrap_taps = grade.and_then(|g| g.wrap.as_ref()).map(|wr| {
+        assert_eq!(wr.mask.len(), wr.light.w * wr.light.h, "wrap mask must match its light");
+        (grid_taps(w, wr.light.w), grid_taps(h, wr.light.h))
+    });
 
     pool().install(|| {
         // Pass 1: matte -> u8 levels, horizontal blur into a float buffer.
@@ -434,6 +493,10 @@ pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
                         // call on baseline x86-64).
                         e.fill((((v + 0.5) as i32) as f32).min(255.0) * INV255);
                     }
+                    if let Some(g) = grade {
+                        graded_row(g, y, wrap_taps.as_ref(), orow, frow, brow, wide);
+                        return;
+                    }
                     // Everything but the scaled difference is a small integer,
                     // so this float math matches the integer blend exactly.
                     for (((o, &f), &b), &a) in orow.iter_mut().zip(frow).zip(brow).zip(wide.iter()) {
@@ -445,6 +508,51 @@ pub fn composite(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize) -> Frame {
     });
     FLOATS.give(tmp);
     out
+}
+
+/// One output row of `composite_graded` under a grade; `a` is the feathered
+/// alpha, repeated per channel.
+fn graded_row(g: &Grade, y: usize, taps: Option<&(Taps, Taps)>, orow: &mut [u8], frow: &[u8], brow: &[u8], a: &[f32]) {
+    let w = frow.len() / 3;
+    let wrap = g.wrap.as_ref().zip(taps).map(|(wr, (xt, yt))| {
+        let (y0, y1, fy) = yt[y];
+        (wr, xt, y0 * wr.light.w, y1 * wr.light.w, fy)
+    });
+    for x in 0..w {
+        let i = x * 3;
+        let av = a[i];
+        let mut f = [frow[i] as f32, frow[i + 1] as f32, frow[i + 2] as f32];
+        if let Some((wr, xt, r0, r1, fy)) = wrap.filter(|_| av > 0.0) {
+            let (x0, x1, fx) = xt[x];
+            let lerp2 = |v00: f32, v01: f32, v10: f32, v11: f32| {
+                let top = v00 + (v01 - v00) * fx;
+                top + (v10 + (v11 - v10) * fx - top) * fy
+            };
+            let k = wr.strength * lerp2(wr.mask[r0 + x0], wr.mask[r0 + x1], wr.mask[r1 + x0], wr.mask[r1 + x1]);
+            if k > 0.004 {
+                let l = &wr.light.data;
+                for (c, fc) in f.iter_mut().enumerate() {
+                    let lv = lerp2(l[(r0 + x0) * 3 + c] as f32, l[(r0 + x1) * 3 + c] as f32,
+                                   l[(r1 + x0) * 3 + c] as f32, l[(r1 + x1) * 3 + c] as f32);
+                    *fc += (lv - *fc) * k;
+                }
+            }
+        }
+        if av >= 1.0 {
+            for c in 0..3 {
+                orow[i + c] = f[c].round().clamp(0.0, 255.0) as u8;
+            }
+            continue;
+        }
+        // Mostly luma grain with a little chroma, like a webcam sensor's.
+        let (n0, n1) = if g.grain > 0.0 { grain_pair(g.seed, (y * w + x) as u32) } else { (0.0, 0.0) };
+        let (luma, chroma) = (g.grain * n0, 0.35 * g.grain * n1);
+        let noise = [luma + chroma, luma, luma - chroma];
+        for c in 0..3 {
+            let b = g.lut[c][brow[i + c] as usize] as f32 + noise[c];
+            orow[i + c] = (b + (f[c] - b) * av).round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -539,5 +647,45 @@ mod tests {
         let bg = Frame::filled(16, 8, [0, 0, 0]);
         assert_eq!(composite(&fg, &bg, &vec![1.0; 128], 3), fg);
         assert_eq!(composite(&fg, &bg, &vec![0.0; 128], 3), bg);
+    }
+
+    #[test]
+    fn identity_grade_matches_plain_composite() {
+        let (w, h) = (40, 24);
+        let mut fg = Frame::new(w, h);
+        let mut bg = Frame::new(w, h);
+        for (i, v) in fg.data.iter_mut().enumerate() {
+            *v = (i * 7 % 251) as u8;
+        }
+        for (i, v) in bg.data.iter_mut().enumerate() {
+            *v = (i * 13 % 241) as u8;
+        }
+        let alpha: Vec<f32> = (0..w * h).map(|i| (i % w) as f32 / (w - 1) as f32).collect();
+        let mut lut = [[0u8; 256]; 3];
+        for c in lut.iter_mut() {
+            for (v, o) in c.iter_mut().enumerate() {
+                *o = v as u8;
+            }
+        }
+        let g = Grade { lut: &lut, grain: 0.0, seed: 0, wrap: None };
+        let plain = composite(&fg, &bg, &alpha, 3);
+        let graded = composite_graded(&fg, &bg, &alpha, 3, Some(&g));
+        // Only the rounding of exact halves may differ.
+        let worst = plain.data.iter().zip(&graded.data).map(|(&p, &q)| (p as i32 - q as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "off by {worst}");
+    }
+
+    #[test]
+    fn grain_is_zero_mean_unit_variance() {
+        let n = 200_000u32;
+        let (mut s, mut ss) = (0f64, 0f64);
+        for i in 0..n {
+            let (a, b) = grain_pair(7, i);
+            s += (a + b) as f64;
+            ss += (a * a + b * b) as f64;
+        }
+        let mean = s / (2 * n) as f64;
+        let var = ss / (2 * n) as f64 - mean * mean;
+        assert!(mean.abs() < 0.01 && (var - 1.0).abs() < 0.02, "mean {mean} var {var}");
     }
 }

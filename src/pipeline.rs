@@ -53,9 +53,9 @@ impl OutputPipeline {
                             let (alpha, fg) = p.finish()?;
                             (Arc::new(fg), Some(alpha))
                         }
-                        None => (job.frame, None),
+                        None => (job.frame.clone(), None),
                     };
-                    let mut out = job.compositor.render(frame, alpha.as_deref());
+                    let mut out = job.compositor.render(frame, &job.frame, alpha.as_deref());
                     if let Some(a) = alpha {
                         imgproc::FLOATS.give(a);
                     }

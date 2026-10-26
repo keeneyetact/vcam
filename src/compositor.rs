@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::imgproc::{self, Frame};
 use crate::kernels;
+use crate::look::Look;
 
 enum Kind {
     /// "Original": send the camera frame untouched (no matting at all).
@@ -12,6 +13,8 @@ enum Kind {
     Blur { sigma: f64 },
     /// A fixed picture (image or solid colour), already sized to the frame.
     Image(Arc<Frame>),
+    /// A picture matched to the live camera (light, focus, grain, light wrap).
+    Realistic(Arc<Frame>, Look),
 }
 
 pub struct Compositor {
@@ -49,6 +52,14 @@ impl Compositor {
         Self::with(Kind::Image(background), w, h)
     }
 
+    /// A picture made to read as the room the camera films (see `look`).
+    /// `softened`: the picture is already out of focus, so no lens blur.
+    pub fn realistic(background: &Frame, softened: bool) -> Self {
+        let (bg, look) = Look::new(background, softened);
+        let (w, h) = bg.size();
+        Self::with(Kind::Realistic(Arc::new(bg), look), w, h)
+    }
+
     pub fn color(w: usize, h: usize, bgr: [u8; 3]) -> Self {
         Self::image(Arc::new(Frame::filled(w, h, bgr)))
     }
@@ -58,7 +69,9 @@ impl Compositor {
     }
 
     /// `alpha` is an HxW matte in [0, 1]; 1 == person, 0 == background.
-    pub fn render(&self, frame: Arc<Frame>, alpha: Option<&[f32]>) -> Arc<Frame> {
+    /// `raw` is the camera frame the matte came from (`frame` is the matted
+    /// foreground), which the realistic look measures.
+    pub fn render(&self, frame: Arc<Frame>, raw: &Frame, alpha: Option<&[f32]>) -> Arc<Frame> {
         let Some(alpha) = alpha else { return frame };
         let bg = match &self.kind {
             Kind::Passthrough => return frame,
@@ -66,11 +79,14 @@ impl Compositor {
                 let small = imgproc::gaussian_blur(&imgproc::resize(&frame, self.bw, self.bh), *sigma);
                 Arc::new(imgproc::resize_linear(&small, frame.w, frame.h))
             }
-            Kind::Image(bg) => bg.clone(),
+            Kind::Image(bg) | Kind::Realistic(bg, _) => bg.clone(),
         };
-        if bg.size() != frame.size() || (self.w, self.h) != frame.size() {
+        if bg.size() != frame.size() || (self.w, self.h) != frame.size() || raw.size() != frame.size() {
             return frame; // background built for another size (being rebuilt)
         }
-        Arc::new(kernels::composite(&frame, &bg, alpha, self.ksize))
+        Arc::new(match &self.kind {
+            Kind::Realistic(_, look) => look.composite(&frame, &bg, raw, alpha, self.ksize),
+            _ => kernels::composite(&frame, &bg, alpha, self.ksize),
+        })
     }
 }

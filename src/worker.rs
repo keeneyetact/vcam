@@ -54,6 +54,9 @@ pub struct Config {
     /// Blur sigma multiplier for Blur mode and `blur_image`; 1.0 is the
     /// original fixed amount.
     pub blur_strength: f32,
+    /// Match the picture background to the live camera (light, focus,
+    /// grain, light wrap) so it reads as the real room.
+    pub realistic: bool,
     pub mirror: bool,
     pub multi_person: bool,
     /// RVM downsample_ratio; None == automatic.
@@ -79,6 +82,7 @@ impl Default for Config {
             color: [64, 177, 0],
             blur_image: false,
             blur_strength: 1.0,
+            realistic: true,
             mirror: false,
             multi_person: false,
             downsample: None,
@@ -212,6 +216,13 @@ impl VCamWorker {
     /// compositor (the sigma is baked into it), off the frame loop.
     pub fn set_blur_strength(&self, strength: f32) {
         self.configure(|c| c.blur_strength = strength);
+        self.shared.bg.lock().unwrap().dirty = true;
+    }
+
+    /// Realistic picture matching on/off; rebuilds the compositor off the
+    /// frame loop.
+    pub fn set_realistic(&self, on: bool) {
+        self.configure(|c| c.realistic = on);
         self.shared.bg.lock().unwrap().dirty = true;
     }
 
@@ -354,10 +365,18 @@ fn build_compositor(sh: &Shared, cfg: &Config, w: usize, h: usize) -> Compositor
         BgMode::Image => {
             if let Some(p) = cfg.bg_path.as_deref().filter(|p| p.is_file()) {
                 match fitted_background(sh, p, w, h) {
-                    Ok(bg) if cfg.blur_image => {
-                        return Compositor::image(Arc::new(imgproc::blur_background_image(&bg, cfg.blur_strength)))
+                    Ok(bg) => {
+                        let bg = if cfg.blur_image {
+                            Arc::new(imgproc::blur_background_image(&bg, cfg.blur_strength))
+                        } else {
+                            bg
+                        };
+                        return if cfg.realistic {
+                            Compositor::realistic(&bg, cfg.blur_image)
+                        } else {
+                            Compositor::image(bg)
+                        };
                     }
-                    Ok(bg) => return Compositor::image(bg),
                     Err(e) => crate::log!("{e:#}; blurring instead"), // unreadable image
                 }
             }

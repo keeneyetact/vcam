@@ -16,6 +16,7 @@ pub mod capture;
 pub mod compositor;
 pub mod imgproc;
 pub mod kernels;
+pub mod look;
 pub mod models;
 pub mod onnx_graph;
 pub mod paths;

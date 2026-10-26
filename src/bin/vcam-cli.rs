@@ -61,6 +61,9 @@ struct Args {
     /// Let the webcam's auto-exposure run (default: fix it so dim light can't slow the frame rate)
     #[arg(long)]
     auto_exposure: bool,
+    /// Paste the background picture as-is (default: match it to your room's light, focus and grain)
+    #[arg(long)]
+    plain: bool,
     /// Keep everyone in frame (default: keep only the single largest person)
     #[arg(long)]
     multi_person: bool,
@@ -133,6 +136,7 @@ fn main() {
         mode,
         bg_path: args.background.clone(),
         color: args.color.unwrap_or(defaults.color),
+        realistic: !args.plain,
         mirror: args.mirror,
         multi_person: args.multi_person,
         fix_exposure: !args.auto_exposure,

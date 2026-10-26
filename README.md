@@ -72,15 +72,16 @@ preview front and centre:
 4. **Background** — Original (no effect), Blur, Image, or Green screen —
    switchable live, with a blur-amount slider. Image opens a gallery: a
    built-in default plus any pictures you add (**+ Add**, Ctrl+O, or drag them
-   onto the window; copied to
-   `%APPDATA%\vcam\backgrounds`). Click one to use it, the ✕ that appears on
-   hover (or Delete) to remove it (your original file is untouched), and optionally soften it. **Match my room
-   (realistic)**, on by default, makes the picture read as the room the camera
-   is filming: its light and colour follow your real room (measured behind
-   you every frame), with a slight lens softness, your webcam's own grain, and
-   a little of the background's light wrapping onto your edges.
-5. **Advanced settings** — Performance (Sharp 720p / Smooth 30 fps), edge
-   detail, only-one-person, and driver reinstall/uninstall.
+   onto the window; copied to `%APPDATA%\vcam\backgrounds`). Click one to use
+   it, the ✕ that appears on hover (or Delete) to remove it (your original file
+   is untouched), and optionally soften it. **Match my room (realistic)**, off
+   by default, makes the picture read as the room the camera is filming: its
+   light and colour follow your real room (measured behind you every frame),
+   with a slight lens softness, your webcam's own grain, and a little of the
+   background's light wrapping onto your edges.
+5. **Advanced settings** (open by default) — Performance (Sharp 720p / Smooth
+   30 fps), edge detail, only-one-person, dim-light frame rate, and driver
+   reinstall/uninstall.
 
 Ctrl+B hides the controls so the preview gets the whole window. The window
 follows the Windows light/dark theme, is DPI-aware, and remembers your
@@ -200,12 +201,13 @@ the output is identical to the stock model to within float rounding (see the
 **The camera** is a per-device **resolution/fps tradeoff**. vcam asks Media
 Foundation for the camera's fastest format at the requested size, but some
 webcams still do 1280×720 at only ~10–20 fps. Dim light is the usual culprit:
-auto-exposure lengthens each exposure past the frame interval. So vcam fixes
+auto-exposure lengthens each exposure past the frame interval. So vcam can fix
 the exposure at the longest that fits a frame (1/32 s at 30 fps) while it owns
-the camera, and restores the camera's own setting afterwards — on a "Full HD
-webcam" that took 720p from 20 to 30 fps. If the picture is too dark, add light
-or turn this off (**Keep full frame rate in dim light** in Advanced settings,
-`--auto-exposure` on the CLI). If the camera itself can't do 30 fps at 720p,
+the camera, and restore the camera's own setting afterwards — on a "Full HD
+webcam" that took 720p from 20 to 30 fps. In the app this is opt-in (**Keep
+full frame rate in dim light** in Advanced settings); the CLI does it by default
+(`--auto-exposure` turns it off). If the picture gets too dark, add light or
+turn it off. If the camera itself can't do 30 fps at 720p,
 capture at a fast resolution and upscale the matted output:
 
 ```bash

@@ -44,13 +44,13 @@ impl Settings {
             bg_path: m.get("bg_path").and_then(Value::as_str).map(PathBuf::from),
             blur_image: b("blur_image", false),
             blur_strength: m.get("blur_strength").and_then(Value::as_f64),
-            realistic: b("realistic", true),
+            realistic: b("realistic", false),
             speed: s("speed"),
             quality: s("quality"),
             one_person: b("one_person", true),
-            fix_exposure: b("fix_exposure", true),
+            fix_exposure: b("fix_exposure", false),
             library_migrated: b("library_migrated", false),
-            advanced_open: b("advanced_open", false),
+            advanced_open: b("advanced_open", true),
             sidebar_open: b("sidebar_open", true),
         }
     }

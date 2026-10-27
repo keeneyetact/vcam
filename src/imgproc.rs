@@ -252,12 +252,14 @@ fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, xt: &Taps, y
 }
 
 /// Resize choosing INTER_AREA when shrinking an axis and INTER_LINEAR otherwise.
-/// Brightening curve for a dim camera picture, `amount` 0-1 (0 == unchanged):
-/// a gamma lift of the shadows and midtones, so black and white stay put and
-/// nothing clips. At 1, mid-grey (128) comes out at ~171.
+/// Brightness curve for the camera picture, `amount` -1 (darker) to 1
+/// (brighter), 0 == unchanged: a gamma curve on the shadows and midtones, so
+/// black and white stay put and nothing clips. Mid-grey (128) comes out at
+/// ~171 at 1 and ~56 at -1.
 pub fn brighten_lut(amount: f32) -> [u8; 256] {
-    let inv_gamma = 1.0 / (1.0 + 1.2 * amount.clamp(0.0, 1.0) as f64);
-    std::array::from_fn(|i| ((i as f64 / 255.0).powf(inv_gamma) * 255.0).round() as u8)
+    let k = 1.0 + 1.2 * amount.clamp(-1.0, 1.0).abs() as f64;
+    let exp = if amount >= 0.0 { 1.0 / k } else { k };
+    std::array::from_fn(|i| ((i as f64 / 255.0).powf(exp) * 255.0).round() as u8)
 }
 
 pub fn resize(src: &Frame, w: usize, h: usize) -> Frame {
@@ -450,11 +452,14 @@ mod tests {
     }
 
     #[test]
-    fn brighten_lifts_midtones_only() {
+    fn brightness_moves_midtones_only() {
         assert!(brighten_lut(0.0).iter().enumerate().all(|(i, &v)| v as usize == i));
         let lut = brighten_lut(1.0);
         assert_eq!((lut[0], lut[255]), (0, 255));
         assert!(lut[128] > 160 && lut.windows(2).all(|w| w[0] <= w[1]));
+        let dark = brighten_lut(-1.0);
+        assert_eq!((dark[0], dark[255]), (0, 255));
+        assert!(dark[128] < 70 && dark.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]

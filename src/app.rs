@@ -364,7 +364,7 @@ impl App {
             quality: QUALITY_PRESETS.iter().position(|q| q.0 == s.quality).unwrap_or(QUALITY_DEFAULT),
             one_person: s.one_person,
             fix_exposure: s.fix_exposure,
-            brightness: (s.brightness as f32).clamp(0.0, 1.0),
+            brightness: (s.brightness as f32).clamp(-1.0, 1.0),
             adv_open: s.advanced_open,
             side_open: s.sidebar_open,
             vc: virtualcam::status(),
@@ -1040,6 +1040,33 @@ impl App {
             self.worker.configure(|c| c.mirror = self.mirror);
             self.schedule_save();
         }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Brightness").on_hover_text(
+                "Darkens or brightens the picture's shadows and midtones; black and white stay as they are. \
+                 Double-click the slider to reset.",
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pct = (self.brightness * 100.0).round();
+                let text = if pct == 0.0 { "As captured".to_string() } else { format!("{pct:+.0}%") };
+                ui.label(RichText::new(text).size(12.0).color(p.muted));
+            });
+        });
+        let r = Self::slider(ui, p, &mut self.brightness, -1.0, 1.0);
+        if r.double_clicked() {
+            self.brightness = 0.0;
+        }
+        if r.changed() || r.double_clicked() {
+            // Live: applied from the next frame, no reconnect.
+            self.worker.configure(|c| c.brightness = self.brightness);
+            self.schedule_save();
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Darker").size(12.0).color(p.muted));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("Brighter").size(12.0).color(p.muted));
+            });
+        });
 
         // Background.
         Self::section(ui, p, "BACKGROUND");
@@ -1264,36 +1291,13 @@ impl App {
         if Self::switch(ui, p, &mut self.fix_exposure, "Keep full frame rate in dim light")
             .on_hover_text(
                 "Fixes your webcam's exposure so it can't slow down to brighten the picture \
-                 (many drop to ~20 fps indoors). Raise Brightness if the image looks too dark.",
+                 (many drop to ~20 fps indoors). Raise Brightness under Camera if the image looks too dark.",
             )
             .changed()
         {
             // Reopens the camera with the new setting.
             self.worker.configure(|c| c.fix_exposure = self.fix_exposure);
             self.schedule_save();
-        }
-        if self.fix_exposure {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Brightness").on_hover_text(
-                    "Brightens the dark parts of the picture to make up for the fixed exposure. \
-                     Highlights stay as they are.",
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{:.0}%", self.brightness * 100.0)).size(12.0).color(p.muted));
-                });
-            });
-            if Self::slider(ui, p, &mut self.brightness, 0.0, 1.0).changed() {
-                // Live: applied from the next frame, no reconnect.
-                self.worker.configure(|c| c.brightness = self.brightness);
-                self.schedule_save();
-            }
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("As captured").size(12.0).color(p.muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Brighter").size(12.0).color(p.muted));
-                });
-            });
         }
 
         ui.add_space(8.0);

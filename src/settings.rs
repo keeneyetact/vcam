@@ -24,7 +24,7 @@ pub struct Settings {
     pub quality: String,
     pub one_person: bool,
     pub fix_exposure: bool,
-    /// Dim-light brightening, 0-1.
+    /// Picture brightness, -1 (darker) to 1 (brighter); 0 is as captured.
     pub brightness: f64,
     pub library_migrated: bool,
     pub advanced_open: bool,

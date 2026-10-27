@@ -40,6 +40,12 @@ fn build_session(model: &Path, threads: usize) -> Result<Session> {
     Session::builder(ort_env()?)?
         .with_intra_threads(threads)
         .map_err(err)?
+        // Sleep between runs instead of spin-waiting. The camera paces us, so
+        // each stage idles part of every frame, and spinning through that kept
+        // ~20 of 28 logical CPUs busy (vs ~6.5) on an i7-14700 for the same
+        // fps -- CPU the video-call app needs. Throughput is unchanged.
+        .with_intra_op_spinning(false)
+        .map_err(err)?
         .with_optimization_level(GraphOptimizationLevel::All)
         .map_err(err)?
         .commit_from_file(model)

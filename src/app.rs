@@ -1053,7 +1053,9 @@ impl App {
             });
         });
         let r = Self::slider(ui, p, &mut self.brightness, -1.0, 1.0);
-        if r.double_clicked() {
+        // Snap to "As captured" near the centre, so it's easy to land on
+        // exactly no change.
+        if r.double_clicked() || self.brightness.abs() < 0.04 {
             self.brightness = 0.0;
         }
         if r.changed() || r.double_clicked() {

@@ -206,12 +206,23 @@ webcams still do 1280×720 at only ~10–20 fps. Dim light is the usual culprit:
 auto-exposure lengthens each exposure past the frame interval. So vcam can fix
 the exposure at the longest that fits a frame (1/32 s at 30 fps) while it owns
 the camera, and restore the camera's own setting afterwards — on a "Full HD
-webcam" that took 720p from 20 to 30 fps. In the app this is opt-in (**Keep
-full frame rate in dim light** in Advanced settings); the CLI does it by default
-(`--auto-exposure` turns it off). If the picture gets too dark, raise
-**Brightness** under Camera (`--brightness 0.4`), add light, or turn it off. A
-longer exposure can't brighten it without costing frame rate, so the slider
-lifts the shadows and midtones in software instead, leaving highlights alone.
+webcam" that took 720p from 20 to 30 fps.
+
+The app does this only when it's needed (**Keep full frame rate in dim light**
+in Advanced settings, on by default). The camera keeps its own auto-exposure
+until the delivered rate drops below 85% of nominal. vcam then fixes the
+exposure and lifts the picture with a gamma curve, solved on its brightness
+histogram, so its mean brightness matches what auto-exposure was giving. Black
+and white stay put, so you get the full rate at about the same brightness, with
+a little more grain in a very dim room. If fixing the exposure doesn't raise
+the rate, or the room later gets bright enough, the camera gets its
+auto-exposure back. The CLI fixes the exposure from the start
+(`--auto-exposure` turns it off) and leaves the brightness to you.
+
+A longer exposure can't brighten the picture without costing frame rate, so
+**Brightness** under Camera (`--brightness 0.4`) lifts the shadows and
+midtones in software instead, leaving highlights alone; more light is the
+grain-free fix.
 If the camera itself can't do 30 fps at 720p,
 capture at a fast resolution and upscale the matted output:
 

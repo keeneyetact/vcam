@@ -23,7 +23,8 @@ pub struct Settings {
     pub speed: String,
     pub quality: String,
     pub one_person: bool,
-    pub fix_exposure: bool,
+    /// The dim-light frame-rate fix (adaptive exposure).
+    pub keep_frame_rate: bool,
     /// Picture brightness, -1 (darker) to 1 (brighter); 0 is as captured.
     pub brightness: f64,
     pub library_migrated: bool,
@@ -50,7 +51,9 @@ impl Settings {
             speed: s("speed"),
             quality: s("quality"),
             one_person: b("one_person", true),
-            fix_exposure: b("fix_exposure", false),
+            // A new key: the old "fix_exposure" pinned the exposure always
+            // and was mostly left off for the darker picture.
+            keep_frame_rate: b("keep_frame_rate", true),
             brightness: m.get("brightness").and_then(Value::as_f64).unwrap_or(0.0),
             library_migrated: b("library_migrated", false),
             advanced_open: b("advanced_open", true),
@@ -71,7 +74,7 @@ impl Settings {
             "speed": self.speed,
             "quality": self.quality,
             "one_person": self.one_person,
-            "fix_exposure": self.fix_exposure,
+            "keep_frame_rate": self.keep_frame_rate,
             "brightness": (self.brightness * 1000.0).round() / 1000.0,
             "library_migrated": self.library_migrated,
             "advanced_open": self.advanced_open,

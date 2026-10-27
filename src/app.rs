@@ -17,6 +17,7 @@ use eframe::egui::{
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
+use vcam::capture::ExposureMode;
 use vcam::worker::{BgMode, Preview, Status, VCamWorker};
 use vcam::{capture, imgproc, paths, system, virtualcam, Frame};
 
@@ -50,6 +51,12 @@ const QUALITY_PRESETS: [(&str, f32); 8] = [
     ("Fastest", 0.20),
 ];
 const QUALITY_DEFAULT: usize = 4;
+
+/// The "Keep full frame rate in dim light" switch: on, the exposure is fixed
+/// only once dim light actually slows the camera.
+fn exposure_mode(keep_frame_rate: bool) -> ExposureMode {
+    if keep_frame_rate { ExposureMode::Adaptive } else { ExposureMode::Camera }
+}
 
 /// Blur sigma multiplier range for the "Blur amount" slider (both the live Blur
 /// mode and "Soften image"); 1.0 is the original fixed amount.
@@ -272,7 +279,7 @@ pub struct App {
     speed: usize,
     quality: usize,
     one_person: bool,
-    fix_exposure: bool,
+    keep_frame_rate: bool,
     brightness: f32,
     adv_open: bool,
     side_open: bool,
@@ -363,7 +370,7 @@ impl App {
             speed: SPEED_MODES.iter().position(|m| m.0 == s.speed).unwrap_or(0),
             quality: QUALITY_PRESETS.iter().position(|q| q.0 == s.quality).unwrap_or(QUALITY_DEFAULT),
             one_person: s.one_person,
-            fix_exposure: s.fix_exposure,
+            keep_frame_rate: s.keep_frame_rate,
             brightness: (s.brightness as f32).clamp(-1.0, 1.0),
             adv_open: s.advanced_open,
             side_open: s.sidebar_open,
@@ -415,7 +422,7 @@ impl App {
             speed: SPEED_MODES[self.speed].0.into(),
             quality: QUALITY_PRESETS[self.quality].0.into(),
             one_person: self.one_person,
-            fix_exposure: self.fix_exposure,
+            keep_frame_rate: self.keep_frame_rate,
             brightness: self.brightness as f64,
             library_migrated: true,
             advanced_open: self.adv_open,
@@ -594,7 +601,7 @@ impl App {
             c.realistic = self.realistic;
             c.mirror = self.mirror;
             c.multi_person = !self.one_person;
-            c.fix_exposure = self.fix_exposure;
+            c.exposure = exposure_mode(self.keep_frame_rate);
             c.brightness = self.brightness;
             c.downsample = Some(QUALITY_PRESETS[self.quality].1);
             (c.width, c.height, c.out_width, c.out_height) = (cw, ch, ow, oh);
@@ -1290,15 +1297,16 @@ impl App {
             self.worker.configure(|c| c.multi_person = !self.one_person);
             self.schedule_save();
         }
-        if Self::switch(ui, p, &mut self.fix_exposure, "Keep full frame rate in dim light")
+        if Self::switch(ui, p, &mut self.keep_frame_rate, "Keep full frame rate in dim light")
             .on_hover_text(
-                "Fixes your webcam's exposure so it can't slow down to brighten the picture \
-                 (many drop to ~20 fps indoors). Raise Brightness under Camera if the image looks too dark.",
+                "Many webcams slow to ~20 fps indoors to brighten the picture. When yours does, \
+                 vcam fixes its exposure to hold the full frame rate and brightens the picture itself \
+                 to match. Turn off to leave the exposure entirely to the camera.",
             )
             .changed()
         {
             // Reopens the camera with the new setting.
-            self.worker.configure(|c| c.fix_exposure = self.fix_exposure);
+            self.worker.configure(|c| c.exposure = exposure_mode(self.keep_frame_rate));
             self.schedule_save();
         }
 

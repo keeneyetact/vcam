@@ -260,7 +260,6 @@ fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, xt: &Taps, y
     out
 }
 
-/// Resize choosing INTER_AREA when shrinking an axis and INTER_LINEAR otherwise.
 /// Brightness curve for the camera picture, `amount` -1 (darker) to 1
 /// (brighter), 0 == unchanged: a gamma curve on the shadows and midtones, so
 /// black and white stay put and nothing clips. Mid-grey (128) comes out at
@@ -271,6 +270,14 @@ pub fn brighten_lut(amount: f32) -> [u8; 256] {
     std::array::from_fn(|i| ((i as f64 / 255.0).powf(exp) * 255.0).round() as u8)
 }
 
+/// The camera picture's whole curve as one table: a gamma `lift` (< 1
+/// brightens; the adaptive exposure's compensation), then `brighten_lut(amount)`.
+pub fn camera_lut(lift: f32, amount: f32) -> [u8; 256] {
+    let user = brighten_lut(amount);
+    std::array::from_fn(|i| user[((i as f64 / 255.0).powf(lift as f64) * 255.0).round() as usize])
+}
+
+/// Resize choosing INTER_AREA when shrinking an axis and INTER_LINEAR otherwise.
 pub fn resize(src: &Frame, w: usize, h: usize) -> Frame {
     if (w, h) == (src.w, src.h) {
         return src.clone();
@@ -469,6 +476,14 @@ mod tests {
         let dark = brighten_lut(-1.0);
         assert_eq!((dark[0], dark[255]), (0, 255));
         assert!(dark[128] < 70 && dark.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn camera_lut_lifts_then_applies_brightness() {
+        assert_eq!(camera_lut(1.0, 0.4), brighten_lut(0.4));
+        let lifted = camera_lut(0.6, 0.0);
+        assert_eq!((lifted[0], lifted[255]), (0, 255));
+        assert!(lifted[64] > 100 && lifted.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
-use crate::capture::{CameraInfo, FrameGrabber};
+use crate::capture::{CameraInfo, ExposureMode, FrameGrabber};
 use crate::compositor::Compositor;
 use crate::imgproc::{self, Frame};
 use crate::kernels;
@@ -63,9 +63,9 @@ pub struct Config {
     /// RVM downsample_ratio; None == automatic.
     pub downsample: Option<f32>,
     pub threads: Option<usize>,
-    /// Pin the webcam's exposure so it holds the full frame rate in dim light
-    /// (auto-exposure otherwise slows many webcams to ~20 fps).
-    pub fix_exposure: bool,
+    /// How the webcam's exposure is handled; auto-exposure alone slows many
+    /// webcams to ~20 fps in dim light.
+    pub exposure: ExposureMode,
     /// Darken or brighten the camera picture, -1 to 1 (0 == as captured);
     /// e.g. to make up for the light a fixed exposure gives up.
     pub brightness: f32,
@@ -91,7 +91,7 @@ impl Default for Config {
             multi_person: false,
             downsample: None,
             threads: None,
-            fix_exposure: true,
+            exposure: ExposureMode::Adaptive,
             brightness: 0.0,
             virtualcam: VirtualCamUse::Required,
         }
@@ -103,7 +103,7 @@ impl Config {
     /// everything else (mirror, brightness, downsample, one-person, background) applies
     /// live on the next frame.
     fn restart_key(&self) -> impl PartialEq {
-        (self.camera, self.width, self.height, self.out_width, self.out_height, self.fps, self.threads, self.fix_exposure,
+        (self.camera, self.width, self.height, self.out_width, self.out_height, self.fps, self.threads, self.exposure,
          self.virtualcam)
     }
 }
@@ -436,7 +436,7 @@ fn make_engine(cfg: &Config, w: usize, h: usize) -> Result<RvmEngine> {
 
 fn run_session(sh: &Arc<Shared>) -> Result<()> {
     let cfg = sh.cfg.lock().unwrap().clone();
-    let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.fix_exposure)?;
+    let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure)?;
     let (w, h) = (cam_info.width, cam_info.height);
     crate::log!("Capturing {w}x{h} {} @ {:.0} fps from '{}'", cam_info.format, cam_info.fps, cam_info.name);
     if let Some(e) = cam_info.exposure {
@@ -487,14 +487,15 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         info.status = Status::Running;
     }
 
-    let (mut frames, t0, mut last_seq) = (0u64, Instant::now(), 0u64);
-    // The brightness curve, rebuilt only when the amount changes.
-    let mut lut: Option<(f32, [u8; 256])> = None;
+    let (mut frames, mut since, mut last_seq) = (0u64, Instant::now(), 0u64);
+    // The picture's curve (exposure lift + brightness), rebuilt only when
+    // either changes.
+    let mut lut: Option<((f32, f32), [u8; 256])> = None;
     while !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed) {
         if let Some(e) = pipeline.error() {
             anyhow::bail!(e);
         }
-        let Some((seq, frame)) = grabber.wait_next(last_seq, Duration::from_millis(100)) else {
+        let Some((seq, frame, lift)) = grabber.wait_next(last_seq, Duration::from_millis(100)) else {
             if !grabber.running() {
                 anyhow::bail!("camera stopped delivering frames");
             }
@@ -520,10 +521,11 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         }
         // Adjusted before matting, so the matte and the room matching see
         // the same picture the meeting does.
-        if bright != 0.0 && lut.as_ref().is_none_or(|l| l.0 != bright) {
-            lut = Some((bright, imgproc::brighten_lut(bright)));
+        let adjust = bright != 0.0 || lift != 1.0;
+        if adjust && lut.as_ref().is_none_or(|l| l.0 != (lift, bright)) {
+            lut = Some(((lift, bright), imgproc::camera_lut(lift, bright)));
         }
-        let curve = lut.as_ref().filter(|_| bright != 0.0).map(|l| &l.1);
+        let curve = lut.as_ref().filter(|_| adjust).map(|l| &l.1);
         let frame = if mirror || curve.is_some() {
             Arc::new(kernels::pool().install(|| frame.adjusted(mirror, curve)))
         } else {
@@ -546,7 +548,10 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         }
         frames += 1;
         if frames % 15 == 0 {
-            sh.info.lock().unwrap().fps = frames as f32 / t0.elapsed().as_secs_f32();
+            // The current rate, not the session's average: it moves when
+            // the camera's rate does (e.g. the adaptive exposure kicking in).
+            sh.info.lock().unwrap().fps = 15.0 / since.elapsed().as_secs_f32();
+            since = Instant::now();
         }
     }
     // Drop order: pipeline (drains, then closes the virtual camera), engine, camera.

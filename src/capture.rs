@@ -10,11 +10,12 @@
 //! exposure is pinned to the longest one that still fits a frame (restored when
 //! the camera closes), which holds the full frame rate.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use windows::core::{Interface, GUID, PWSTR};
@@ -128,52 +129,235 @@ fn subtype_name(g: &GUID) -> String {
     }
 }
 
-/// With `fix`, pin the exposure to the longest one that fits a frame at `fps`,
-/// so auto-exposure can't trade frame rate for brightness. Returns the control,
-/// the value set and the (value, flags) to restore; None if not pinned (off, or
-/// the camera has no manual exposure).
-///
-/// The setting lives in the camera, so a session that was killed leaves it
-/// pinned. Manual at exactly our value is taken to be such a leftover: it's
-/// put back to auto rather than kept as "the camera's own" setting.
-unsafe fn pin_exposure(source: &IMFMediaSource, fps: f64, fix: bool) -> Option<(IAMCameraControl, i32, (i32, i32))> {
-    let cc: IAMCameraControl = source.cast().ok()?;
-    let id = CameraControl_Exposure.0;
-    let (mut lo, mut hi, mut step, mut def, mut caps) = (0, 0, 0, 0, 0);
-    cc.GetRange(id, &mut lo, &mut hi, &mut step, &mut def, &mut caps).ok()?;
-    if caps & CameraControl_Flags_Manual.0 == 0 {
-        return None;
-    }
-    let (mut value, mut flags) = (0, 0);
-    cc.Get(id, &mut value, &mut flags).ok()?;
-    // Exposure is in log2 seconds: 2^-5 s = 31 ms is the longest under 33 ms.
-    let v = (-(fps.max(1.0).log2().ceil() as i32)).clamp(lo, hi);
-    let mut orig = (value, flags);
-    if flags == CameraControl_Flags_Manual.0 && value == v && caps & CameraControl_Flags_Auto.0 != 0 {
-        orig = (def, CameraControl_Flags_Auto.0);
-    }
-    if !fix {
-        if orig != (value, flags) {
+/// How the webcam's exposure is handled. In dim light a webcam's
+/// auto-exposure lengthens each exposure past the frame interval and drops to
+/// ~15-20 fps; pinning it to the longest exposure that fits a frame holds the
+/// full rate, at the cost of a darker picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExposureMode {
+    /// The camera's own auto-exposure, untouched.
+    Camera,
+    /// Pinned from the start.
+    Fixed,
+    /// The camera's auto-exposure while it holds the frame rate; pinned once
+    /// dim light slows it, with the picture lifted back to the brightness
+    /// auto-exposure was giving (see `Adaptive`).
+    Adaptive,
+}
+
+/// The camera's exposure control, and what to put back.
+struct ExposureControl {
+    cc: IAMCameraControl,
+    /// The longest exposure that fits a frame, log2 seconds.
+    fixed: i32,
+    /// The camera's own (value, flags), restored on release.
+    orig: (i32, i32),
+    pinned: bool,
+}
+
+impl ExposureControl {
+    /// None if the camera has no manual exposure.
+    ///
+    /// The setting lives in the camera, so a session that was killed leaves it
+    /// pinned. Manual at exactly our value is taken to be such a leftover: it's
+    /// put back to auto rather than kept as "the camera's own" setting.
+    unsafe fn open(source: &IMFMediaSource, fps: f64) -> Option<Self> {
+        let cc: IAMCameraControl = source.cast().ok()?;
+        let id = CameraControl_Exposure.0;
+        let (mut lo, mut hi, mut step, mut def, mut caps) = (0, 0, 0, 0, 0);
+        cc.GetRange(id, &mut lo, &mut hi, &mut step, &mut def, &mut caps).ok()?;
+        if caps & CameraControl_Flags_Manual.0 == 0 {
+            return None;
+        }
+        let (mut value, mut flags) = (0, 0);
+        cc.Get(id, &mut value, &mut flags).ok()?;
+        // Exposure is in log2 seconds: 2^-5 s = 31 ms is the longest under 33 ms.
+        let fixed = (-(fps.max(1.0).log2().ceil() as i32)).clamp(lo, hi);
+        let mut orig = (value, flags);
+        if flags == CameraControl_Flags_Manual.0 && value == fixed && caps & CameraControl_Flags_Auto.0 != 0 {
+            orig = (def, CameraControl_Flags_Auto.0);
             let _ = cc.Set(id, orig.0, orig.1);
         }
-        return None;
+        Some(Self { cc, fixed, orig, pinned: false })
     }
-    cc.Set(id, v, CameraControl_Flags_Manual.0).ok()?;
-    Some((cc, v, orig))
+
+    fn pin(&mut self) -> bool {
+        self.pinned = unsafe { self.cc.Set(CameraControl_Exposure.0, self.fixed, CameraControl_Flags_Manual.0) }.is_ok();
+        self.pinned
+    }
+
+    fn release(&mut self) {
+        if std::mem::take(&mut self.pinned) {
+            unsafe {
+                let _ = self.cc.Set(CameraControl_Exposure.0, self.orig.0, self.orig.1);
+            }
+        }
+    }
+}
+
+/// How long the rate is measured over, and how long to let the camera settle
+/// after its exposure changes before judging it.
+const RATE_WINDOW: Duration = Duration::from_secs(2);
+const SETTLE: Duration = Duration::from_secs(3);
+/// Pin when auto-exposure delivers less than this share of the nominal rate.
+const SLOW: f64 = 0.85;
+
+/// `ExposureMode::Adaptive`, fed one frame at a time on the camera thread.
+///
+/// While pinned, the picture is lifted with a gamma curve that maps its mean
+/// brightness back to what auto-exposure was giving (black and white stay
+/// put), so the switch doesn't darken it; it follows the room from there
+/// much as auto-exposure would. Once the room is bright enough that the
+/// pinned picture outshines that, auto-exposure would hold the rate itself,
+/// and it gets the camera back.
+struct Adaptive {
+    fps: f64,
+    /// Frame arrival times over the last `RATE_WINDOW`.
+    times: VecDeque<Instant>,
+    /// When the exposure last changed (camera opened, pinned or released).
+    changed: Instant,
+    /// Smoothed mean luma under auto-exposure: the brightness to keep.
+    target: Option<f32>,
+    /// Smoothed mean luma while pinned.
+    pinned: Option<f32>,
+    /// Smoothed exact `lift`, before it's rounded.
+    smooth: Option<f32>,
+    /// Since when the pinned picture has been clearly brighter than `target`.
+    bright_since: Option<Instant>,
+    /// Pinning didn't raise the rate (it's slow for some other reason).
+    gave_up: bool,
+    /// Gamma exponent for the frames; 1 == as captured, < 1 brightens.
+    lift: f32,
+}
+
+impl Adaptive {
+    fn new(fps: f64) -> Self {
+        Self {
+            fps,
+            times: VecDeque::new(),
+            changed: Instant::now(),
+            target: None,
+            pinned: None,
+            smooth: None,
+            bright_since: None,
+            gave_up: false,
+            lift: 1.0,
+        }
+    }
+
+    fn step(&mut self, ctl: &mut ExposureControl, frame: &Frame) {
+        let now = Instant::now();
+        let ema = |v: Option<f32>, x: f32| v.map_or(x, |v| v + (x - v) * 0.1);
+        let hist = luma_histogram(frame);
+        let luma = lifted_mean(&hist, 1.0);
+        self.times.push_back(now);
+        while self.times.front().is_some_and(|&t| now - t > RATE_WINDOW) {
+            self.times.pop_front();
+        }
+        // The window is shorter than the settle time, so it's all post-change.
+        let settled = now - self.changed >= SETTLE;
+        let slow = settled && (self.times.len() as f64) < SLOW * self.fps * RATE_WINDOW.as_secs_f64();
+        if !ctl.pinned {
+            self.lift = 1.0;
+            self.target = Some(ema(self.target, luma));
+            if slow && !self.gave_up && ctl.pin() {
+                crate::log!(
+                    "Dim light slowed the camera to {:.0} fps: exposure fixed at 1/{} s, picture brightened to match",
+                    self.times.len() as f64 / RATE_WINDOW.as_secs_f64(),
+                    1u32 << -ctl.fixed.min(0)
+                );
+                (self.changed, self.pinned, self.smooth, self.bright_since) = (now, None, None, None);
+            }
+            return;
+        }
+        if slow {
+            crate::log!("Fixing the exposure didn't raise the frame rate; back to the camera's auto-exposure");
+            self.gave_up = true;
+            self.release(ctl, now);
+            return;
+        }
+        // The new exposure takes a few frames to arrive.
+        if now - self.changed < Duration::from_millis(300) {
+            return;
+        }
+        let p = ema(self.pinned, luma);
+        self.pinned = Some(p);
+        let target = self.target.unwrap_or(p).clamp(16.0, 235.0);
+        let e = ema(self.smooth, lift_for(&hist, target));
+        self.smooth = Some(e);
+        self.lift = (e * 100.0).round() / 100.0; // steps, so the curve isn't rebuilt every frame
+        if p > target * 1.15 {
+            if now - *self.bright_since.get_or_insert(now) >= SETTLE {
+                crate::log!("Enough light for the full frame rate: back to the camera's auto-exposure");
+                self.release(ctl, now);
+            }
+        } else {
+            self.bright_since = None;
+        }
+    }
+
+    fn release(&mut self, ctl: &mut ExposureControl, now: Instant) {
+        ctl.release();
+        (self.changed, self.lift) = (now, 1.0);
+    }
+}
+
+/// Luma histogram of a frame, sampled every 8th pixel each way.
+fn luma_histogram(f: &Frame) -> [u32; 256] {
+    let mut hist = [0u32; 256];
+    for y in (0..f.h).step_by(8) {
+        for px in f.data[y * f.w * 3..][..f.w * 3].chunks_exact(3).step_by(8) {
+            let l = (29 * px[0] as u32 + 150 * px[1] as u32 + 77 * px[2] as u32 + 128) >> 8; // BGR
+            hist[l as usize] += 1;
+        }
+    }
+    hist
+}
+
+/// Mean luma of the histogram's picture after a gamma `lift`.
+fn lifted_mean(hist: &[u32; 256], lift: f32) -> f32 {
+    let (mut sum, mut n) = (0f64, 0u64);
+    for (v, &c) in hist.iter().enumerate().filter(|(_, &c)| c > 0) {
+        sum += c as f64 * (v as f64 / 255.0).powf(lift as f64);
+        n += c as u64;
+    }
+    (255.0 * sum / n.max(1) as f64) as f32
+}
+
+/// The lift (0.45..=1) that brings the picture's mean luma to `target`. A
+/// curve moves the mean less than it moves the mean's own level, so this is
+/// solved on the histogram (by bisection: the mean falls as the lift rises).
+fn lift_for(hist: &[u32; 256], target: f32) -> f32 {
+    let (mut lo, mut hi) = (0.45f32, 1.0f32);
+    if lifted_mean(hist, hi) >= target {
+        return hi;
+    }
+    if lifted_mean(hist, lo) <= target {
+        return lo;
+    }
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        if lifted_mean(hist, mid) > target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 struct Camera {
     reader: IMFSourceReader,
     source: IMFMediaSource,
-    /// Exposure control + the original (value, flags), restored on drop.
-    exposure: Option<(IAMCameraControl, (i32, i32))>,
+    /// Restored on drop.
+    exposure: Option<ExposureControl>,
     w: usize,
     h: usize,
     stride: i32,
 }
 
 impl Camera {
-    fn open(index: usize, width: usize, height: usize, fps: f64, fix_exposure: bool) -> Result<(Self, CameraInfo)> {
+    fn open(index: usize, width: usize, height: usize, fps: f64, mode: ExposureMode) -> Result<(Self, CameraInfo)> {
         let busy = || {
             anyhow!(
                 "Could not open camera {index}. A webcam can only be used by one app at a time; close \
@@ -240,16 +424,20 @@ impl Camera {
             let cur = reader.GetCurrentMediaType(FIRST_VIDEO)?;
             let (w, h) = split_u64(cur.GetUINT64(&MF_MT_FRAME_SIZE)?);
             let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(w as i32 * 4);
-            let pinned = pin_exposure(&source, f, fix_exposure);
+            // Opened even for `Camera`, to clear a leftover pin.
+            let exposure = ExposureControl::open(&source, f).filter(|_| mode != ExposureMode::Camera);
+            let exposure = match (mode, exposure) {
+                (ExposureMode::Fixed, Some(mut e)) => e.pin().then_some(e),
+                (_, e) => e,
+            };
             let info = CameraInfo {
                 name,
                 width: w as usize,
                 height: h as usize,
                 fps: f,
                 format: tag,
-                exposure: pinned.as_ref().map(|p| p.1),
+                exposure: exposure.as_ref().filter(|e| e.pinned).map(|e| e.fixed),
             };
-            let exposure = pinned.map(|(cc, _, orig)| (cc, orig));
             Ok((Camera { reader, source, exposure, w: w as usize, h: h as usize, stride }, info))
         }
     }
@@ -308,8 +496,8 @@ impl Drop for Camera {
     fn drop(&mut self) {
         unsafe {
             // Hand the camera back as we found it (other apps share the setting).
-            if let Some((cc, (value, flags))) = &self.exposure {
-                let _ = cc.Set(CameraControl_Exposure.0, *value, *flags);
+            if let Some(e) = &mut self.exposure {
+                e.release();
             }
             let _ = self.source.Shutdown();
         }
@@ -318,6 +506,8 @@ impl Drop for Camera {
 
 struct GrabState {
     frame: Option<Arc<Frame>>,
+    /// The frame's adaptive-exposure lift (1 == none); see `Adaptive`.
+    lift: f32,
     seq: u64,
     running: bool,
 }
@@ -333,8 +523,8 @@ pub struct FrameGrabber {
 }
 
 impl FrameGrabber {
-    pub fn start(index: usize, width: usize, height: usize, fps: f64, fix_exposure: bool) -> Result<(Self, CameraInfo)> {
-        let shared = Arc::new((Mutex::new(GrabState { frame: None, seq: 0, running: true }), Condvar::new()));
+    pub fn start(index: usize, width: usize, height: usize, fps: f64, exposure: ExposureMode) -> Result<(Self, CameraInfo)> {
+        let shared = Arc::new((Mutex::new(GrabState { frame: None, lift: 1.0, seq: 0, running: true }), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (info_tx, info_rx) = mpsc::sync_channel::<Result<CameraInfo>>(1);
         let (done_tx, done) = mpsc::channel();
@@ -343,10 +533,11 @@ impl FrameGrabber {
             let _done = done_tx; // dropped (=> signalled) when this thread ends
             let run = || -> Result<()> {
                 let _mf = MfThread::init()?;
-                let mut cam = match Camera::open(index, width, height, fps, fix_exposure) {
+                let (mut cam, mut adaptive) = match Camera::open(index, width, height, fps, exposure) {
                     Ok((cam, info)) => {
+                        let adaptive = (exposure == ExposureMode::Adaptive).then(|| Adaptive::new(info.fps));
                         let _ = info_tx.send(Ok(info));
-                        cam
+                        (cam, adaptive)
                     }
                     Err(e) => {
                         let _ = info_tx.send(Err(e));
@@ -354,10 +545,18 @@ impl FrameGrabber {
                     }
                 };
                 while !st.load(Ordering::Relaxed) {
-                    let frame = Arc::new(cam.read()?);
+                    let frame = cam.read()?;
+                    let lift = match (&mut adaptive, &mut cam.exposure) {
+                        (Some(a), Some(ctl)) => {
+                            a.step(ctl, &frame);
+                            a.lift
+                        }
+                        _ => 1.0,
+                    };
                     let (lock, cv) = &*sh;
                     let mut g = lock.lock().unwrap();
-                    g.frame = Some(frame);
+                    g.frame = Some(Arc::new(frame));
+                    g.lift = lift;
                     g.seq += 1;
                     cv.notify_all();
                 }
@@ -378,7 +577,8 @@ impl FrameGrabber {
 
     /// Block until a frame newer than `last_seq` arrives (woken by the camera
     /// thread, not by polling). None on timeout or when the camera has stopped.
-    pub fn wait_next(&self, last_seq: u64, timeout: Duration) -> Option<(u64, Arc<Frame>)> {
+    /// Also returns the gamma lift the frame needs (1 == none; see `Adaptive`).
+    pub fn wait_next(&self, last_seq: u64, timeout: Duration) -> Option<(u64, Arc<Frame>, f32)> {
         let (lock, cv) = &*self.shared;
         let g = lock.lock().unwrap();
         let (g, _) = cv
@@ -387,7 +587,7 @@ impl FrameGrabber {
         if g.seq == last_seq {
             return None;
         }
-        g.frame.clone().map(|f| (g.seq, f))
+        g.frame.clone().map(|f| (g.seq, f, g.lift))
     }
 }
 
@@ -400,5 +600,23 @@ impl Drop for FrameGrabber {
         if let Some(t) = self.thread.take().filter(|_| ended) {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lift_brings_the_mean_to_target() {
+        // A dark, spread-out picture: levels 10..130.
+        let mut hist = [0u32; 256];
+        for v in 10..130 {
+            hist[v] = 5;
+        }
+        let e = lift_for(&hist, 110.0);
+        assert!(e < 1.0 && (lifted_mean(&hist, e) - 110.0).abs() < 0.5, "lift {e}");
+        assert_eq!(lift_for(&hist, 40.0), 1.0); // already bright enough: never darkens
+        assert_eq!(lift_for(&hist, 250.0), 0.45); // capped
     }
 }

@@ -17,6 +17,7 @@ use windows::core::BOOL;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
 use vcam::worker::{BgMode, Config, Status, VCamWorker, VirtualCamUse};
+use vcam::capture::ExposureMode;
 use vcam::{capture, log};
 
 #[derive(Parser)]
@@ -158,7 +159,7 @@ fn main() {
         realistic: !args.plain,
         mirror: args.mirror,
         multi_person: args.multi_person,
-        fix_exposure: !args.auto_exposure,
+        exposure: if args.auto_exposure { ExposureMode::Camera } else { ExposureMode::Fixed },
         brightness: args.brightness.unwrap_or(defaults.brightness),
         downsample: args.downsample,
         threads: args.threads,

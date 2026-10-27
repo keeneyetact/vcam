@@ -211,27 +211,38 @@ fn coverage(alpha: &[f32], w: usize, h: usize, sw: usize, sh: usize) -> Vec<f32>
     out
 }
 
-/// In-place separable Gaussian blur of a small single-channel plane.
+/// In-place separable Gaussian blur of a small single-channel plane, rows
+/// split across the kernel pool. Runs every frame, so the horizontal taps read
+/// a reflect-padded row and the vertical pass accumulates whole rows (no
+/// per-tap border handling); the sums are in the same order as the plain loop.
 fn blur_plane(p: &mut [f32], w: usize, h: usize, sigma: f32) {
     let r = (sigma * 3.0).ceil() as isize;
     let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
     let ks: f32 = k.iter().sum();
     let k: Vec<f32> = k.iter().map(|v| v / ks).collect();
     let mut tmp = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            tmp[y * w + x] = k.iter().enumerate()
-                .map(|(j, &kv)| kv * p[y * w + imgproc::reflect101(x as isize + j as isize - r, w)])
-                .sum();
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            p[y * w + x] = k.iter().enumerate()
-                .map(|(j, &kv)| kv * tmp[imgproc::reflect101(y as isize + j as isize - r, h) * w + x])
-                .sum();
-        }
-    }
+    kernels::pool().install(|| {
+        tmp.par_chunks_mut(w).zip(p.par_chunks(w)).for_each_init(
+            || vec![0f32; w + k.len() - 1],
+            |pad, (t, s)| {
+                for (i, v) in pad.iter_mut().enumerate() {
+                    *v = s[imgproc::reflect101(i as isize - r, w)];
+                }
+                for (x, t) in t.iter_mut().enumerate() {
+                    *t = pad[x..x + k.len()].iter().zip(&k).map(|(v, kv)| kv * v).sum();
+                }
+            },
+        );
+        p.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            row.fill(0.0);
+            for (j, &kv) in k.iter().enumerate() {
+                let src = &tmp[imgproc::reflect101(y as isize + j as isize - r, h) * w..][..w];
+                for (o, &v) in row.iter_mut().zip(src) {
+                    *o += kv * v;
+                }
+            }
+        });
+    });
 }
 
 #[cfg(test)]

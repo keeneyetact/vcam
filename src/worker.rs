@@ -12,6 +12,7 @@ use anyhow::Result;
 use crate::capture::{CameraInfo, FrameGrabber};
 use crate::compositor::Compositor;
 use crate::imgproc::{self, Frame};
+use crate::kernels;
 use crate::pipeline::OutputPipeline;
 use crate::rvm::RvmEngine;
 use crate::virtualcam::VirtualCam;
@@ -517,14 +518,14 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         if let Some((gen, c)) = load {
             load_compositor_async(sh, gen, c, w, h);
         }
-        let frame = if mirror { Arc::new(frame.flipped()) } else { frame };
         // Adjusted before matting, so the matte and the room matching see
         // the same picture the meeting does.
-        let frame = if bright != 0.0 {
-            if lut.as_ref().is_none_or(|l| l.0 != bright) {
-                lut = Some((bright, imgproc::brighten_lut(bright)));
-            }
-            Arc::new(frame.mapped(&lut.as_ref().unwrap().1))
+        if bright != 0.0 && lut.as_ref().is_none_or(|l| l.0 != bright) {
+            lut = Some((bright, imgproc::brighten_lut(bright)));
+        }
+        let curve = lut.as_ref().filter(|_| bright != 0.0).map(|l| &l.1);
+        let frame = if mirror || curve.is_some() {
+            Arc::new(kernels::pool().install(|| frame.adjusted(mirror, curve)))
         } else {
             frame
         };

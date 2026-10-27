@@ -119,22 +119,31 @@ impl Frame {
 
     /// Horizontally mirrored copy.
     pub fn flipped(&self) -> Frame {
-        let mut out = Frame::scratch(self.w, self.h);
-        let w = self.w;
-        out.data.par_chunks_mut(w * 3).zip(self.data.par_chunks(w * 3)).for_each(|(o, s)| {
-            for x in 0..w {
-                o[x * 3..x * 3 + 3].copy_from_slice(&s[(w - 1 - x) * 3..(w - 1 - x) * 3 + 3]);
-            }
-        });
-        out
+        self.adjusted(true, None)
     }
 
     /// Copy with every byte mapped through `lut` (e.g. `brighten_lut`).
     pub fn mapped(&self, lut: &[u8; 256]) -> Frame {
+        self.adjusted(false, Some(lut))
+    }
+
+    /// Copy, optionally mirrored and/or mapped through `lut`, in one pass (on
+    /// the inference thread, so both together cost one frame copy, not two).
+    pub fn adjusted(&self, mirror: bool, lut: Option<&[u8; 256]>) -> Frame {
         let mut out = Frame::scratch(self.w, self.h);
-        out.data.par_chunks_mut(3 * 1024).zip(self.data.par_chunks(3 * 1024)).for_each(|(o, s)| {
-            for (d, &v) in o.iter_mut().zip(s) {
-                *d = lut[v as usize];
+        let w = self.w;
+        out.data.par_chunks_mut(w * 3).zip(self.data.par_chunks(w * 3)).for_each(|(o, s)| {
+            if mirror {
+                for (d, p) in o.chunks_exact_mut(3).zip(s.chunks_exact(3).rev()) {
+                    d.copy_from_slice(p);
+                }
+            } else {
+                o.copy_from_slice(s);
+            }
+            if let Some(lut) = lut {
+                for v in o.iter_mut() {
+                    *v = lut[*v as usize];
+                }
             }
         });
         out

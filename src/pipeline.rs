@@ -15,10 +15,12 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::compositor::Compositor;
 use crate::imgproc::{self, Frame};
+use crate::kernels;
 use crate::rvm::Pending;
 use crate::virtualcam::VirtualCam;
 
-pub type OnOutput = Box<dyn Fn(&Arc<Frame>) + Send>;
+/// Called on a kernel-pool thread, so it must be `Sync`.
+pub type OnOutput = Box<dyn Fn(&Arc<Frame>) + Send + Sync>;
 
 struct Job {
     compositor: Arc<Compositor>,
@@ -47,7 +49,10 @@ impl OutputPipeline {
                 if e.lock().unwrap().is_some() {
                     continue; // drain quietly so submit() never blocks
                 }
-                let r = (|| -> Result<()> {
+                // In the small kernel pool, so the image ops in here (blur,
+                // resize, NV12, preview) don't spread over every core and
+                // crowd out the next frame's inference, like the kernels.
+                let r = kernels::pool().install(|| -> Result<()> {
                     let (frame, alpha) = match job.pending {
                         Some(p) => {
                             let (alpha, fg) = p.finish()?;
@@ -74,7 +79,7 @@ impl OutputPipeline {
                         cb(&out);
                     }
                     Ok(())
-                })();
+                });
                 if let Err(err) = r {
                     *e.lock().unwrap() = Some(format!("{err:#}"));
                 }

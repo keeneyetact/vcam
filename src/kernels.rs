@@ -66,10 +66,20 @@ fn rte(x: f32) -> f32 {
     (x + MAGIC) - MAGIC
 }
 
+/// `rte(x) as u8` for x in [0, 255] (not NaN), but vectorizable: the float
+/// `as` cast's saturation and NaN checks make LLVM scalarize the loop (~2.7x
+/// slower per byte). x + 1.5 * 2^23 holds the rounded integer in the low
+/// mantissa bits, so it's read straight out of the bit pattern.
+#[inline(always)]
+fn level_u8(x: f32) -> u8 {
+    const MAGIC: f32 = 12_582_912.0;
+    (x + MAGIC).to_bits() as u8
+}
+
 /// Saturating x*255 like cv2.convertScaleAbs (abs, round half to even).
 #[inline(always)]
 fn unit_to_u8(v: f32) -> u8 {
-    rte((v * 255.0).abs().min(255.0)) as u8 // `as` saturates (and maps NaN to 0)
+    level_u8((v * 255.0).abs().min(255.0)) // `min` also maps NaN to 255
 }
 
 /// RVM foreground float32 (1,3,H,W) RGB in [0,1] -> BGR frame.
@@ -501,7 +511,7 @@ pub fn composite_graded(fg: &Frame, bg: &Frame, alpha: &[f32], ksize: usize, gra
                     // so this float math matches the integer blend exactly.
                     for (((o, &f), &b), &a) in orow.iter_mut().zip(frow).zip(brow).zip(wide.iter()) {
                         let (fv, bv) = (f as f32, b as f32);
-                        *o = (bv + rte((fv - bv) * a)).clamp(0.0, 255.0) as u8;
+                        *o = level_u8((bv + rte((fv - bv) * a)).clamp(0.0, 255.0));
                     }
                 },
             );
@@ -540,7 +550,7 @@ fn graded_row(g: &Grade, y: usize, taps: Option<&(Taps, Taps)>, orow: &mut [u8],
         }
         if av >= 1.0 {
             for c in 0..3 {
-                orow[i + c] = f[c].round().clamp(0.0, 255.0) as u8;
+                orow[i + c] = round_u8(f[c]);
             }
             continue;
         }
@@ -550,9 +560,17 @@ fn graded_row(g: &Grade, y: usize, taps: Option<&(Taps, Taps)>, orow: &mut [u8],
         let noise = [luma + chroma, luma, luma - chroma];
         for c in 0..3 {
             let b = g.lut[c][brow[i + c] as usize] as f32 + noise[c];
-            orow[i + c] = (b + (f[c] - b) * av).round().clamp(0.0, 255.0) as u8;
+            orow[i + c] = round_u8(b + (f[c] - b) * av);
         }
     }
+}
+
+/// `v.round().clamp(0.0, 255.0) as u8` without the libm `round` call (and so
+/// vectorizable): once clamped, v >= 0 and truncating v + 0.5 rounds half away
+/// from zero. (Only 0.49999997, the f32 just below 0.5, comes out a level high.)
+#[inline(always)]
+fn round_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 255.0) + 0.5) as u8
 }
 
 #[cfg(test)]
@@ -639,6 +657,19 @@ mod tests {
             keep_largest(&mut a, h, w);
             assert_eq!(a, expect, "{h}x{w} @ {density}");
         }
+    }
+
+    #[test]
+    fn level_u8_matches_rounding_cast() {
+        // Every multiple of 1/64 in [0, 255] (all the exact halves included),
+        // plus the f32s next to each half.
+        for i in 0..=255 * 64 {
+            let x = i as f32 / 64.0;
+            for v in [x, f32::from_bits(x.to_bits().saturating_sub(1)), f32::from_bits(x.to_bits() + 1).min(255.0)] {
+                assert_eq!(level_u8(v), rte(v) as u8, "{v}");
+            }
+        }
+        assert_eq!((unit_to_u8(f32::NAN), unit_to_u8(-0.5), unit_to_u8(2.0)), (255, 128, 255));
     }
 
     #[test]

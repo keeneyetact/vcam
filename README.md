@@ -80,7 +80,8 @@ preview front and centre:
    with a slight lens softness, your webcam's own grain, and a little of the
    background's light wrapping onto your edges.
 5. **Advanced settings** (open by default) — Performance (Sharp 720p / Smooth
-   30 fps), edge detail, only-one-person, dim-light frame rate, and driver
+   30 fps), edge detail, only-one-person, dim-light frame rate (with a
+   **Brightness** slider to make up for the darker picture), and driver
    reinstall/uninstall.
 
 Ctrl+B hides the controls so the preview gets the whole window. The window
@@ -134,6 +135,7 @@ terminal.
 | `--fps` | `30` | Target frame rate |
 | `--mirror` | off | Horizontally flip (selfie view) |
 | `--auto-exposure` | off | Let the webcam's auto-exposure run (it can slow to ~20 fps in dim light; see Performance) |
+| `--brightness` | `0` | Brighten the picture 0–1 to make up for the fixed exposure (lifts shadows, keeps highlights) |
 | `--plain` | off | Paste the background picture as-is (default: match it to your room's light, focus and grain) |
 | `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
 | `--no-preview` | off | Don't open the preview window |
@@ -206,8 +208,11 @@ the exposure at the longest that fits a frame (1/32 s at 30 fps) while it owns
 the camera, and restore the camera's own setting afterwards — on a "Full HD
 webcam" that took 720p from 20 to 30 fps. In the app this is opt-in (**Keep
 full frame rate in dim light** in Advanced settings); the CLI does it by default
-(`--auto-exposure` turns it off). If the picture gets too dark, add light or
-turn it off. If the camera itself can't do 30 fps at 720p,
+(`--auto-exposure` turns it off). If the picture gets too dark, raise
+**Brightness** under it (`--brightness 0.4`), add light, or turn it off. A
+longer exposure can't brighten it without costing frame rate, so the slider
+lifts the shadows and midtones in software instead, leaving highlights alone.
+If the camera itself can't do 30 fps at 720p,
 capture at a fast resolution and upscale the matted output:
 
 ```bash

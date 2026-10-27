@@ -129,6 +129,17 @@ impl Frame {
         out
     }
 
+    /// Copy with every byte mapped through `lut` (e.g. `brighten_lut`).
+    pub fn mapped(&self, lut: &[u8; 256]) -> Frame {
+        let mut out = Frame::scratch(self.w, self.h);
+        out.data.par_chunks_mut(3 * 1024).zip(self.data.par_chunks(3 * 1024)).for_each(|(o, s)| {
+            for (d, &v) in o.iter_mut().zip(s) {
+                *d = lut[v as usize];
+            }
+        });
+        out
+    }
+
     /// RGB bytes (for display).
     pub fn to_rgb(&self) -> Vec<u8> {
         let mut out = BYTES.scratch(self.data.len());
@@ -241,6 +252,14 @@ fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, xt: &Taps, y
 }
 
 /// Resize choosing INTER_AREA when shrinking an axis and INTER_LINEAR otherwise.
+/// Brightening curve for a dim camera picture, `amount` 0-1 (0 == unchanged):
+/// a gamma lift of the shadows and midtones, so black and white stay put and
+/// nothing clips. At 1, mid-grey (128) comes out at ~171.
+pub fn brighten_lut(amount: f32) -> [u8; 256] {
+    let inv_gamma = 1.0 / (1.0 + 1.2 * amount.clamp(0.0, 1.0) as f64);
+    std::array::from_fn(|i| ((i as f64 / 255.0).powf(inv_gamma) * 255.0).round() as u8)
+}
+
 pub fn resize(src: &Frame, w: usize, h: usize) -> Frame {
     if (w, h) == (src.w, src.h) {
         return src.clone();
@@ -428,6 +447,14 @@ mod tests {
         let c = resize_cover(&f, 128, 72);
         assert_eq!((c.w, c.h), (128, 72));
         assert!(c.data.chunks(3).all(|p| p == [1, 2, 3]));
+    }
+
+    #[test]
+    fn brighten_lifts_midtones_only() {
+        assert!(brighten_lut(0.0).iter().enumerate().all(|(i, &v)| v as usize == i));
+        let lut = brighten_lut(1.0);
+        assert_eq!((lut[0], lut[255]), (0, 255));
+        assert!(lut[128] > 160 && lut.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]

@@ -65,6 +65,9 @@ pub struct Config {
     /// Pin the webcam's exposure so it holds the full frame rate in dim light
     /// (auto-exposure otherwise slows many webcams to ~20 fps).
     pub fix_exposure: bool,
+    /// Brighten the camera picture 0-1 (0 == as captured), to make up for the
+    /// light a fixed exposure gives up. Only applied with `fix_exposure`.
+    pub brightness: f32,
     pub virtualcam: VirtualCamUse,
 }
 
@@ -88,6 +91,7 @@ impl Default for Config {
             downsample: None,
             threads: None,
             fix_exposure: true,
+            brightness: 0.0,
             virtualcam: VirtualCamUse::Required,
         }
     }
@@ -95,7 +99,7 @@ impl Default for Config {
 
 impl Config {
     /// Options that need the capture/engine/virtual-cam pipeline rebuilt;
-    /// everything else (mirror, downsample, one-person, background) applies
+    /// everything else (mirror, brightness, downsample, one-person, background) applies
     /// live on the next frame.
     fn restart_key(&self) -> impl PartialEq {
         (self.camera, self.width, self.height, self.out_width, self.out_height, self.fps, self.threads, self.fix_exposure,
@@ -483,6 +487,8 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
     }
 
     let (mut frames, t0, mut last_seq) = (0u64, Instant::now(), 0u64);
+    // The brightening curve, rebuilt only when the amount changes.
+    let mut lut: Option<(f32, [u8; 256])> = None;
     while !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed) {
         if let Some(e) = pipeline.error() {
             anyhow::bail!(e);
@@ -494,7 +500,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             continue;
         };
         last_seq = seq;
-        let (load, mirror, want_dsr, multi) = {
+        let (load, mirror, bright, want_dsr, multi) = {
             let mut bg = sh.bg.lock().unwrap();
             let cfg = sh.cfg.lock().unwrap();
             let mut load = None;
@@ -506,12 +512,23 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             if let Some(c) = bg.pending.take() {
                 compositor = c;
             }
-            (load, cfg.mirror, cfg.downsample, cfg.multi_person)
+            let bright = if cfg.fix_exposure { cfg.brightness } else { 0.0 };
+            (load, cfg.mirror, bright, cfg.downsample, cfg.multi_person)
         };
         if let Some((gen, c)) = load {
             load_compositor_async(sh, gen, c, w, h);
         }
         let frame = if mirror { Arc::new(frame.flipped()) } else { frame };
+        // Brightened before matting, so the matte and the room matching see
+        // the same picture the meeting does.
+        let frame = if bright > 0.0 {
+            if lut.as_ref().is_none_or(|l| l.0 != bright) {
+                lut = Some((bright, imgproc::brighten_lut(bright)));
+            }
+            Arc::new(frame.mapped(&lut.as_ref().unwrap().1))
+        } else {
+            frame
+        };
         if compositor.is_passthrough() {
             // Original camera: skip matting entirely (saves the CPU); the
             // engine stays loaded so switching back is instant.

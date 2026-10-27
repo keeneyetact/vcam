@@ -61,6 +61,9 @@ struct Args {
     /// Let the webcam's auto-exposure run (default: fix it so dim light can't slow the frame rate)
     #[arg(long)]
     auto_exposure: bool,
+    /// Brighten the picture 0-1 to make up for the fixed exposure (default 0: as captured)
+    #[arg(long, value_parser = parse_brightness, conflicts_with = "auto_exposure")]
+    brightness: Option<f32>,
     /// Paste the background picture as-is (default: match it to your room's light, focus and grain)
     #[arg(long)]
     plain: bool,
@@ -99,6 +102,14 @@ fn parse_downsample(text: &str) -> Result<f32, String> {
     match text.trim().parse::<f32>() {
         Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
         _ => Err("--downsample must be a number above 0 and at most 1, e.g. 0.375".into()),
+    }
+}
+
+/// Dim-light brightening must be in [0, 1].
+fn parse_brightness(text: &str) -> Result<f32, String> {
+    match text.trim().parse::<f32>() {
+        Ok(v) if (0.0..=1.0).contains(&v) => Ok(v),
+        _ => Err("--brightness must be a number from 0 to 1, e.g. 0.4".into()),
     }
 }
 
@@ -148,6 +159,7 @@ fn main() {
         mirror: args.mirror,
         multi_person: args.multi_person,
         fix_exposure: !args.auto_exposure,
+        brightness: args.brightness.unwrap_or(defaults.brightness),
         downsample: args.downsample,
         threads: args.threads,
         virtualcam: if args.no_virtualcam { VirtualCamUse::Off } else { VirtualCamUse::Optional },

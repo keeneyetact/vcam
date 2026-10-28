@@ -1278,8 +1278,11 @@ impl App {
             self.schedule_save();
         }
         ui.add_space(6.0);
-        self.ui_framing(ui, &ctx, CropTarget::Camera);
-        ui.add_space(6.0);
+        if self.mode != BgMode::None {
+            // With Original it sits under the background tiles instead.
+            self.ui_framing(ui, &ctx, CropTarget::Camera);
+            ui.add_space(6.0);
+        }
         ui.horizontal(|ui| {
             ui.label("Brightness").on_hover_text(
                 "Darkens or brightens the picture's shadows and midtones; black and white stay as they are. \
@@ -1322,7 +1325,7 @@ impl App {
             for (i, &(mode, _, label)) in MODES.iter().enumerate() {
                 let r = Self::tile(ui, p, tile_w, self.tile_tex.get(i), img, label, self.mode == mode);
                 let r = r.on_hover_text(match mode {
-                    BgMode::None => "Your real camera, no background effect.",
+                    BgMode::None => "Your real camera, no background effect. You can still crop it.",
                     BgMode::Blur => "Blur the room behind you.",
                     BgMode::Image => "Replace the room with a picture.",
                     BgMode::Color => "Green screen: solid green, for apps (like OBS) that key it out.",
@@ -1337,6 +1340,11 @@ impl App {
             self.apply_bg(&ctx);
         }
 
+        // Original's one option: which part of the camera picture to send.
+        if self.mode == BgMode::None {
+            ui.add_space(6.0);
+            self.ui_framing(ui, &ctx, CropTarget::Camera);
+        }
         // The picture options go above the gallery, which can grow long.
         if self.mode == BgMode::Image {
             ui.add_space(6.0);

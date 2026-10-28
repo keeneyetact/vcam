@@ -561,6 +561,9 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
     // The picture's curve (exposure lift + brightness), rebuilt only when
     // either changes.
     let mut lut: Option<((f32, f32), [u8; 256])> = None;
+    // The camera crop in the camera's own (unmirrored) frame, for the last
+    // (framing, mirror) seen.
+    let mut raw_crop: Option<((Framing, bool), Framing)> = None;
     while !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed) {
         if let Some(e) = pipeline.error() {
             anyhow::bail!(e);
@@ -597,18 +600,32 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             lut = Some(((lift, bright), imgproc::camera_lut(lift, bright)));
         }
         let curve = lut.as_ref().filter(|_| adjust).map(|l| &l.1);
+        if sh.want_raw.load(Ordering::Relaxed) {
+            // The crop editor shows the whole picture as the call would see it.
+            let whole = if mirror || curve.is_some() {
+                Arc::new(kernels::pool().install(|| frame.adjusted(mirror, curve)))
+            } else {
+                frame.clone()
+            };
+            *sh.latest_raw.lock().unwrap() = Some(whole);
+        }
+        // The crop is chosen on the mirrored picture; find it in the camera's.
+        if raw_crop.as_ref().is_none_or(|r| r.0 != (cam_framing, mirror)) {
+            let [x0, y0, x1, y1] = cam_framing.effective_crop(w, h, w as f32 / h as f32);
+            let crop = if mirror { [1.0 - x1, y0, 1.0 - x0, y1] } else { [x0, y0, x1, y1] };
+            grabber.set_region(crop);
+            raw_crop = Some(((cam_framing, mirror), Framing { crop, ..cam_framing }));
+        }
+        // Everything from here on -- brightness, matting, faces, the room
+        // matching, the output -- sees only the crop, resized back to the
+        // capture size: the engine and background keep their size, so it
+        // changes live (~1 ms at 720p).
+        let frame = match raw_crop.as_ref().map(|r| r.1).filter(|_| cam_framing != Framing::default()) {
+            Some(f) => Arc::new(kernels::pool().install(|| imgproc::frame_camera(&frame, &f, w, h))),
+            None => frame,
+        };
         let frame = if mirror || curve.is_some() {
             Arc::new(kernels::pool().install(|| frame.adjusted(mirror, curve)))
-        } else {
-            frame
-        };
-        if sh.want_raw.load(Ordering::Relaxed) {
-            *sh.latest_raw.lock().unwrap() = Some(frame.clone());
-        }
-        // The camera crop, resized back to the capture size: the engine and
-        // background keep their size, so it changes live (~1 ms at 720p).
-        let frame = if cam_framing != Framing::default() {
-            Arc::new(kernels::pool().install(|| imgproc::frame_camera(&frame, &cam_framing, w, h)))
         } else {
             frame
         };

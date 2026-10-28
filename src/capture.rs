@@ -245,10 +245,12 @@ impl Adaptive {
         }
     }
 
-    fn step(&mut self, ctl: &mut ExposureControl, frame: &Frame) {
+    /// `region`: the part of the frame that's used (x0, y0, x1, y1 as
+    /// fractions), whose brightness is the one to keep.
+    fn step(&mut self, ctl: &mut ExposureControl, frame: &Frame, region: [f32; 4]) {
         let now = Instant::now();
         let ema = |v: Option<f32>, x: f32| v.map_or(x, |v| v + (x - v) * 0.1);
-        let hist = luma_histogram(frame);
+        let hist = luma_histogram(frame, region);
         let luma = lifted_mean(&hist, 1.0);
         self.times.push_back(now);
         while self.times.front().is_some_and(|&t| now - t > RATE_WINDOW) {
@@ -302,11 +304,16 @@ impl Adaptive {
     }
 }
 
-/// Luma histogram of a frame, sampled every 8th pixel each way.
-fn luma_histogram(f: &Frame) -> [u32; 256] {
+/// Luma histogram of `region` of a frame (fractions), sampled every 8th pixel
+/// each way (closer for a small region).
+fn luma_histogram(f: &Frame, region: [f32; 4]) -> [u32; 256] {
+    let px = |v: f32, n: usize| ((v.clamp(0.0, 1.0) * n as f32) as usize).min(n - 1);
+    let (x0, y0) = (px(region[0], f.w), px(region[1], f.h));
+    let (x1, y1) = (px(region[2], f.w).max(x0) + 1, px(region[3], f.h).max(y0) + 1);
+    let step = ((x1 - x0).min(y1 - y0) / 40).clamp(1, 8);
     let mut hist = [0u32; 256];
-    for y in (0..f.h).step_by(8) {
-        for px in f.data[y * f.w * 3..][..f.w * 3].chunks_exact(3).step_by(8) {
+    for y in (y0..y1).step_by(step) {
+        for px in f.data[(y * f.w + x0) * 3..][..(x1 - x0) * 3].chunks_exact(3).step_by(step) {
             let l = (29 * px[0] as u32 + 150 * px[1] as u32 + 77 * px[2] as u32 + 128) >> 8; // BGR
             hist[l as usize] += 1;
         }
@@ -508,6 +515,8 @@ struct GrabState {
     frame: Option<Arc<Frame>>,
     /// The frame's adaptive-exposure lift (1 == none); see `Adaptive`.
     lift: f32,
+    /// The part of the frame that's used, whose brightness counts.
+    region: [f32; 4],
     seq: u64,
     running: bool,
 }
@@ -524,7 +533,7 @@ pub struct FrameGrabber {
 
 impl FrameGrabber {
     pub fn start(index: usize, width: usize, height: usize, fps: f64, exposure: ExposureMode) -> Result<(Self, CameraInfo)> {
-        let shared = Arc::new((Mutex::new(GrabState { frame: None, lift: 1.0, seq: 0, running: true }), Condvar::new()));
+        let shared = Arc::new((Mutex::new(GrabState { frame: None, lift: 1.0, region: [0.0, 0.0, 1.0, 1.0], seq: 0, running: true }), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (info_tx, info_rx) = mpsc::sync_channel::<Result<CameraInfo>>(1);
         let (done_tx, done) = mpsc::channel();
@@ -548,7 +557,8 @@ impl FrameGrabber {
                     let frame = cam.read()?;
                     let lift = match (&mut adaptive, &mut cam.exposure) {
                         (Some(a), Some(ctl)) => {
-                            a.step(ctl, &frame);
+                            let region = sh.0.lock().unwrap().region;
+                            a.step(ctl, &frame, region);
                             a.lift
                         }
                         _ => 1.0,
@@ -573,6 +583,12 @@ impl FrameGrabber {
 
     pub fn running(&self) -> bool {
         self.shared.0.lock().unwrap().running
+    }
+
+    /// The part of the frame that's used (x0, y0, x1, y1 as fractions): the
+    /// dim-light brightening keeps that part's brightness.
+    pub fn set_region(&self, region: [f32; 4]) {
+        self.shared.0.lock().unwrap().region = region;
     }
 
     /// Block until a frame newer than `last_seq` arrives (woken by the camera
@@ -606,6 +622,20 @@ impl Drop for FrameGrabber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn histogram_measures_only_the_region() {
+        // Left half black, right half white.
+        let mut f = Frame::new(320, 180);
+        for row in f.data.chunks_exact_mut(320 * 3) {
+            row[160 * 3..].fill(255);
+        }
+        let right = luma_histogram(&f, [0.5, 0.0, 1.0, 1.0]);
+        assert!(right[255] > 0 && right[0] == 0);
+        let whole = luma_histogram(&f, [0.0, 0.0, 1.0, 1.0]);
+        assert!(whole[255] > 0 && whole[0] > 0);
+        assert!(luma_histogram(&f, [0.1, 0.1, 0.12, 0.12]).iter().sum::<u32>() > 0); // tiny crop still samples
+    }
 
     #[test]
     fn lift_brings_the_mean_to_target() {

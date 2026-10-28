@@ -181,7 +181,9 @@ pub fn friendly_error(raw: &str) -> String {
          then press Start camera."
             .into()
     } else if m.contains("obs") || m.contains("virtual camera") || m.contains("backend") {
-        "The virtual camera isn't set up yet. Use “Set up virtual camera” on the right, then press Start camera.".into()
+        "The virtual camera isn't set up yet. Use “Set up virtual camera” in the controls (Ctrl+B shows them), then \
+         press Start camera."
+            .into()
     } else {
         format!("Something went wrong: {raw}")
     }
@@ -964,19 +966,33 @@ impl App {
         }
 
         // Status pill (top-left).
+        // The pill sits on black, so it takes the bright amber in either theme.
+        // Running without the driver is only a preview: say so, as nobody in
+        // the call can see it.
+        let amber = DARK.warn;
         let pill = match state {
             Status::Running => {
-                let dev = self.worker.device().map(|d| format!("  ·  {d}")).unwrap_or_default();
-                Some((format!("●  LIVE  ·  {:.0} fps{dev}", self.worker.fps()), hex(0xff5a5a)))
+                let fps = self.worker.fps();
+                Some(match self.worker.device() {
+                    Some(d) => (format!("●  LIVE  ·  {fps:.0} fps  ·  {d}"), hex(0xff5a5a), None),
+                    None => (
+                        format!("●  PREVIEW ONLY  ·  {fps:.0} fps"),
+                        amber,
+                        Some("Meet, Zoom and Teams can't see this yet: set up the virtual camera in the controls."),
+                    ),
+                })
             }
-            Status::Starting => Some(("●  Starting camera…".to_string(), p.warn)),
+            Status::Starting => Some(("●  Starting camera…".to_string(), amber, None)),
             _ => None,
         };
-        if let Some((text, color)) = pill {
+        if let Some((text, color, tip)) = pill {
             let galley = painter.layout_no_wrap(text, semi(12.0), color);
             let r = Rect::from_min_size(rect.min + vec2(12.0, 12.0), galley.size() + vec2(20.0, 8.0));
             painter.rect_filled(r, 4.0, Color32::from_black_alpha(200));
             painter.galley(r.min + vec2(10.0, 4.0), galley, color);
+            if let Some(tip) = tip {
+                ui.interact(r, ui.make_persistent_id("status_pill"), Sense::hover()).on_hover_text(tip);
+            }
         }
 
         // Error bar (bottom), hover for the technical detail.
@@ -1000,6 +1016,11 @@ impl App {
         let (head, sub, button) = match state {
             Status::Starting => ("Starting your camera…", "The first start can take a few seconds.", None),
             Status::Error => ("Your camera stopped", "See the message below for what to do.", Some("Try again")),
+            _ if self.cameras.is_empty() => (
+                "No webcam found",
+                "Connect one — vcam looks again when you come back to this window.",
+                Some("Start camera"),
+            ),
             _ => ("Your camera is off", "Start it to see your preview and go live in your call.", Some("Start camera")),
         };
         let bright = Color32::from_gray(232);
@@ -1156,7 +1177,8 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(vec2(width, pad * 2.0 + img_h + label_h), Sense::click());
         resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
         let hovered = resp.hovered();
-        let fill = if selected || hovered { p.tile_sel } else { p.tile };
+        // Only the chosen tile is tinted, so hovering never reads as choosing.
+        let fill = if selected { p.tile_sel } else { p.tile };
         let stroke = if selected { Stroke::new(2.0, p.accent) } else { Stroke::new(1.0, if hovered { p.muted } else { p.border }) };
         let painter = ui.painter();
         painter.rect(rect, 6.0, fill, stroke, StrokeKind::Inside);
@@ -1188,13 +1210,22 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(RichText::new("vcam").font(semi(20.0)));
+                let running = self.worker.running();
+                let sending = running && self.worker.device().is_some();
                 let (text, color) = match (&self.busy, self.vc.installed) {
                     (Some(b), _) => (b.clone(), p.muted),
-                    (None, true) if self.worker.running() => ("● Live in Meet, Zoom & Teams".into(), p.danger),
+                    _ if sending => ("● Live in Meet, Zoom & Teams".into(), p.danger),
+                    _ if running => ("● Preview only — calls can't see it yet".into(), p.warn),
                     (None, true) => ("● Ready for Meet, Zoom & Teams".into(), p.success),
                     (None, false) => ("Virtual camera not set up".into(), p.muted),
                 };
-                ui.label(RichText::new(text).size(12.0).color(color));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if self.busy.is_some() {
+                        ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+                    }
+                    ui.label(RichText::new(text).size(12.0).color(color));
+                });
             });
         });
 
@@ -1220,7 +1251,12 @@ impl App {
                                 .into()
                         }
                     });
-                    ui.label(text);
+                    ui.horizontal_wrapped(|ui| {
+                        if self.busy.is_some() {
+                            ui.add(egui::Spinner::new().size(14.0).color(p.warn));
+                        }
+                        ui.label(text);
+                    });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let idle = self.busy.is_none();
@@ -1372,14 +1408,17 @@ impl App {
         if self.mode == BgMode::Blur || (self.mode == BgMode::Image && self.blur_image) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Blur amount");
+                ui.label("Blur amount").on_hover_text("How out of focus the background looks. Double-click the slider to reset.");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let pct = (self.blur - BLUR_MIN) / (BLUR_MAX - BLUR_MIN) * 100.0;
                     ui.label(RichText::new(format!("{pct:.0}%")).size(12.0).color(p.muted));
                 });
             });
             let r = Self::slider(ui, p, &mut self.blur, BLUR_MIN, BLUR_MAX);
-            if r.changed() {
+            if r.double_clicked() {
+                self.blur = BLUR_DEFAULT;
+            }
+            if r.changed() || r.double_clicked() {
                 // Live: rebuilds the compositor with the new sigma, no reconnect.
                 self.worker.set_blur_strength(self.blur);
                 self.schedule_save();
@@ -1654,7 +1693,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Whole picture").on_hover_text("Undo the crop").clicked() {
+                    if ui.button("Reset crop").on_hover_text("Use the whole picture again").clicked() {
                         set(&mut f, &mut changed, Framing::WHOLE, false);
                     }
                     if !camera {
@@ -1942,10 +1981,19 @@ impl App {
         ui.label("Virtual camera driver");
         ui.horizontal(|ui| {
             let idle = self.busy.is_none();
-            if ui.add_enabled(idle && self.vc.obs_found, egui::Button::new("Reinstall")).clicked() {
+            let install = if self.vc.installed { "Reinstall" } else { "Install" };
+            if ui
+                .add_enabled(idle && self.vc.obs_found, egui::Button::new(install))
+                .on_disabled_hover_text("Needs OBS Studio installed first.")
+                .clicked()
+            {
                 self.vcam_action(ctx, true);
             }
-            if ui.add_enabled(idle && self.vc.installed, egui::Button::new("Uninstall")).clicked() {
+            if ui
+                .add_enabled(idle && self.vc.installed, egui::Button::new("Uninstall"))
+                .on_hover_text("Removes vcam from Meet, Zoom and Teams' camera lists.")
+                .clicked()
+            {
                 self.vcam_action(ctx, false);
             }
         });

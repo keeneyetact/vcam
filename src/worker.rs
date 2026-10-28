@@ -611,10 +611,12 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         }
         // The crop is chosen on the mirrored picture; find it in the camera's.
         if raw_crop.as_ref().is_none_or(|r| r.0 != (cam_framing, mirror)) {
-            let [x0, y0, x1, y1] = cam_framing.effective_crop(w, h, w as f32 / h as f32);
-            let crop = if mirror { [1.0 - x1, y0, 1.0 - x0, y1] } else { [x0, y0, x1, y1] };
+            let aspect = cam_framing.target_aspect(w as f32 / h as f32);
+            let flip = |[x0, y0, x1, y1]: [f32; 4]| if mirror { [1.0 - x1, y0, 1.0 - x0, y1] } else { [x0, y0, x1, y1] };
+            let crop = flip(cam_framing.effective_crop(w, h, aspect));
             grabber.set_region(crop);
-            raw_crop = Some(((cam_framing, mirror), Framing { crop, ..cam_framing }));
+            let place = flip(Framing::clamped(cam_framing.place));
+            raw_crop = Some(((cam_framing, mirror), Framing { crop, place, ..cam_framing }));
         }
         // Everything from here on -- brightness, matting, faces, the room
         // matching, the output -- sees only the crop, resized back to the

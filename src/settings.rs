@@ -112,15 +112,19 @@ impl Settings {
 
 fn framing_from(v: &Value) -> Option<Framing> {
     let fit = v.get("fit").and_then(Value::as_str).and_then(|n| FITS.iter().find(|f| f.1 == n))?.0;
-    let c = v.get("crop").and_then(Value::as_array).filter(|a| a.len() == 4)?;
-    let mut crop = [0f32; 4];
-    for (o, v) in crop.iter_mut().zip(c) {
-        *o = v.as_f64()? as f32;
-    }
-    Some(Framing { fit, crop: Framing::clamped(crop) })
+    let rect = |key: &str| -> Option<[f32; 4]> {
+        let a = v.get(key).and_then(Value::as_array).filter(|a| a.len() == 4)?;
+        let mut r = [0f32; 4];
+        for (o, v) in r.iter_mut().zip(a) {
+            *o = v.as_f64()? as f32;
+        }
+        Some(Framing::clamped(r))
+    };
+    Some(Framing { fit, crop: rect("crop")?, place: rect("place").unwrap_or(Framing::WHOLE) })
 }
 
 fn framing_to(f: &Framing) -> Value {
     let fit = FITS.iter().find(|x| x.0 == f.fit).map_or("fill", |x| x.1);
-    json!({ "fit": fit, "crop": f.crop.map(|v| (v as f64 * 10000.0).round() / 10000.0) })
+    let r = |r: [f32; 4]| r.map(|v| (v as f64 * 10000.0).round() / 10000.0);
+    json!({ "fit": fit, "crop": r(f.crop), "place": r(f.place) })
 }

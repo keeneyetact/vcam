@@ -403,11 +403,13 @@ struct CropEditor {
     shown: Option<Arc<Frame>>,
     /// What's being dragged, the crop when the drag began, and where.
     drag: Option<(Grip, [f32; 4], Pos2)>,
+    /// The same for the place in the frame (camera only).
+    place_drag: Option<(Grip, [f32; 4], Pos2)>,
 }
 
 impl CropEditor {
     fn camera() -> Self {
-        Self { target: CropTarget::Camera, tex: None, job: None, shown: None, drag: None }
+        Self { target: CropTarget::Camera, tex: None, job: None, shown: None, drag: None, place_drag: None }
     }
 
     fn picture(ctx: &egui::Context, path: PathBuf) -> Self {
@@ -423,7 +425,7 @@ impl CropEditor {
             let _ = tx.send(img);
             ctx.request_repaint();
         });
-        Self { target: CropTarget::Picture(path), tex: None, job: Some(rx), shown: None, drag: None }
+        Self { target: CropTarget::Picture(path), tex: None, job: Some(rx), shown: None, drag: None, place_drag: None }
     }
 }
 
@@ -753,7 +755,7 @@ impl App {
     fn set_framing_of(&mut self, ctx: &egui::Context, target: &CropTarget, f: Framing, dragging: bool) {
         match target {
             CropTarget::Camera => {
-                self.cam_framing = Framing { crop: Framing::clamped(f.crop), ..f };
+                self.cam_framing = Framing { crop: Framing::clamped(f.crop), place: Framing::clamped(f.place), ..f };
                 self.worker.configure(|c| c.camera_framing = self.cam_framing); // live, from the next frame
                 self.schedule_save();
             }
@@ -1432,7 +1434,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(if camera { "Camera framing" } else { "Framing" });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let text = if f.crop == Framing::WHOLE { "Crop…" } else { "Edit crop…" };
+                let text = if (f.crop, f.place) == (Framing::WHOLE, Framing::WHOLE) { "Crop…" } else { "Edit crop…" };
                 open = Self::link(ui, p, text)
                     .on_hover_text(if camera {
                         "Choose the part of the camera picture to use (a digital zoom); only that part is \
@@ -1498,8 +1500,10 @@ impl App {
             }
         }
         let p = self.pal();
-        let aspect = self.frame_aspect();
+        let frame_aspect = self.frame_aspect();
         let mut f = self.framing_of(&ed.target);
+        // The shape the crop goes into: the frame, or the camera's place in it.
+        let aspect = f.target_aspect(frame_aspect);
         let camera = ed.target == CropTarget::Camera;
         let mut changed: Option<bool> = None; // Some(still dragging)
         let mut open = !ctx.input(|i| i.key_pressed(Key::Escape));
@@ -1511,7 +1515,8 @@ impl App {
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
-                let box_size = vec2(560.0, 380.0);
+                // Shorter for the camera, which has the place box below.
+                let box_size = vec2(560.0, if camera { 280.0 } else { 380.0 });
                 ui.set_width(box_size.x);
                 if let Some(fit) = Self::fit_tiles(ui, p, f.fit) {
                     f.fit = fit;
@@ -1530,7 +1535,7 @@ impl App {
                 let [iw, ih] = tex.size();
                 let k = (box_size.x / iw as f32).min(box_size.y / ih as f32);
                 let size = vec2(iw as f32 * k, ih as f32 * k);
-                // Fill keeps the frame's shape (as a w / h of picture fractions).
+                // Fill keeps the place's shape (as a w / h of picture fractions).
                 let lock = (f.fit == FitMode::Fill).then(|| aspect * ih as f32 / iw as f32);
                 let crop = f.effective_crop(iw, ih, aspect);
 
@@ -1615,7 +1620,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(if lock.is_some() {
-                        "Drag to move, drag a corner to resize, scroll to zoom. Fill keeps the frame's shape."
+                        "Drag to move, drag a corner to resize, scroll to zoom. Fill keeps the shape it goes into."
                     } else {
                         "Drag to move, drag a corner or edge to resize, scroll to zoom."
                     })
@@ -1652,10 +1657,23 @@ impl App {
                     if ui.button("Whole picture").on_hover_text("Undo the crop").clicked() {
                         set(&mut f, &mut changed, Framing::WHOLE, false);
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        done = ui.button("  Done  ").clicked();
-                    });
+                    if !camera {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            done = ui.button("  Done  ").clicked();
+                        });
+                    }
                 });
+                if camera {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    Self::ui_place(ui, p, &mut ed, &tex, &mut f, &mut changed, frame_aspect);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            done = ui.button("  Done  ").clicked();
+                        });
+                    });
+                }
             });
         if let Some(dragging) = changed {
             self.set_framing_of(ctx, &ed.target, f, dragging);
@@ -1668,6 +1686,108 @@ impl App {
             self.tile_stale = false;
             self.render_thumbs(ctx);
         }
+    }
+
+    /// Where the camera crop goes in the frame: a small frame with the crop
+    /// on it, to move, resize or zoom; the background fills the rest.
+    fn ui_place(ui: &mut egui::Ui, p: &Palette, ed: &mut CropEditor, tex: &TextureHandle, f: &mut Framing,
+                changed: &mut Option<bool>, frame_aspect: f32) {
+        let set = |f: &mut Framing, changed: &mut Option<bool>, c: [f32; 4], dragging: bool| {
+            if c != f.place || !dragging {
+                f.place = c;
+                *changed = Some(dragging);
+            }
+        };
+        ui.label("Position in the frame");
+        let size = vec2(320.0, (320.0 / frame_aspect).round());
+        let (rect, resp) = ui.vertical_centered(|ui| ui.allocate_exact_size(size, Sense::click_and_drag())).inner;
+        let to_screen = |c: [f32; 4]| Rect::from_min_max(rect.min + vec2(c[0], c[1]) * size, rect.min + vec2(c[2], c[3]) * size);
+        let place = Framing::clamped(f.place);
+        let pr = to_screen(place);
+        // Resizing keeps the place's shape when zooming; dragging is free.
+        let shape = Some((place[2] - place[0]) / (place[3] - place[1]));
+        if resp.drag_started() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                ed.place_drag = Some(match grip_at(pr, pos, false) {
+                    Some(g) => (g, place, pos),
+                    None => (Grip::MOVE, dragged_crop(place, Grip::MOVE, (pos - pr.center()) / size, None), pos),
+                });
+            }
+        }
+        if let (Some((grip, start, from)), Some(pos)) = (ed.place_drag, resp.interact_pointer_pos()) {
+            if resp.dragged() {
+                set(f, changed, dragged_crop(start, grip, (pos - from) / size, None), true);
+            }
+        }
+        if resp.drag_stopped() {
+            ed.place_drag = None;
+            let c = f.place;
+            set(f, changed, c, false);
+        }
+        if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos().filter(|&pos| grip_at(pr, pos, false).is_none()) {
+                set(f, changed, dragged_crop(place, Grip::MOVE, (pos - pr.center()) / size, None), false);
+            }
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                set(f, changed, zoomed_crop(place, (-scroll * 0.002).exp(), shape), true);
+            }
+        }
+        let hover = resp.hover_pos().and_then(|pos| grip_at(pr, pos, false));
+        if let Some(g) = ed.place_drag.map(|d| d.0).or(hover) {
+            ui.ctx().set_cursor_icon(g.cursor(ed.place_drag.is_some()));
+        }
+
+        // The frame (the background's part), and the crop where it goes.
+        let painter = ui.painter();
+        painter.rect(rect, 4.0, p.preview, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        painter.text(rect.center_bottom() - vec2(0.0, 10.0), Align2::CENTER_CENTER, "Your background",
+                     FontId::proportional(11.0), p.preview_text);
+        let pr = to_screen(Framing::clamped(f.place));
+        let [iw, ih] = tex.size();
+        let [x0, y0, x1, y1] = f.effective_crop(iw, ih, f.target_aspect(frame_aspect));
+        let shown = if f.fit == FitMode::Fit {
+            let (cw, ch) = ((x1 - x0) * iw as f32, (y1 - y0) * ih as f32);
+            let k = (pr.width() / cw).min(pr.height() / ch);
+            Rect::from_center_size(pr.center(), vec2(cw * k, ch * k))
+        } else {
+            pr
+        };
+        egui::Image::from_texture(tex).uv(Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))).paint_at(ui, shown);
+        let painter = ui.painter();
+        painter.rect_stroke(pr, 0.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+        for g in [pr.left_top(), pr.right_top(), pr.left_bottom(), pr.right_bottom(), pr.center_top(), pr.center_bottom(),
+                  pr.left_center(), pr.right_center()] {
+            painter.rect(Rect::from_center_size(g, vec2(9.0, 9.0)), 1.5, Color32::WHITE,
+                         Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Middle);
+        }
+        ui.label(
+            RichText::new("Drag to move, drag a corner or edge to resize, scroll to zoom. Your background fills \
+                           the rest (black with Original).")
+                .size(12.0)
+                .color(p.muted),
+        );
+        let place = Framing::clamped(f.place);
+        ui.horizontal(|ui| {
+            ui.label("Place");
+            for (label, x, y) in [
+                ("Left", Some(-1), None),
+                ("Top", None, Some(-1)),
+                ("Centre", Some(0), Some(0)),
+                ("Bottom", None, Some(1)),
+                ("Right", Some(1), None),
+            ] {
+                if ui.button(label).clicked() {
+                    set(f, changed, aligned_crop(place, x, y), false);
+                }
+            }
+            ui.separator();
+            if ui.button("Full frame").on_hover_text("Fill the whole frame again").clicked() {
+                set(f, changed, Framing::WHOLE, false);
+            }
+        });
     }
 
     fn ui_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

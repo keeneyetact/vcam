@@ -342,17 +342,21 @@ pub enum FitMode {
     Stretch,
 }
 
-/// Which part of a background picture is used, and how it's fitted.
+/// Which part of a picture is used, where in the frame it goes, and how it's
+/// fitted there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Framing {
     pub fit: FitMode,
     /// The crop as fractions of the picture: x0, y0, x1, y1.
     pub crop: [f32; 4],
+    /// Where the crop goes, as fractions of the frame; the rest of the frame
+    /// is left empty (black for the camera, so the background shows there).
+    pub place: [f32; 4],
 }
 
 impl Default for Framing {
     fn default() -> Self {
-        Self { fit: FitMode::Fill, crop: Self::WHOLE }
+        Self { fit: FitMode::Fill, crop: Self::WHOLE, place: Self::WHOLE }
     }
 }
 
@@ -372,8 +376,14 @@ impl Framing {
         [x0, y0, x1, y1]
     }
 
-    /// The crop actually used for an (iw, ih) picture in a frame of
-    /// `aspect` (w / h): for Fill, trimmed to the frame's shape.
+    /// The shape (w / h) of the place in a frame of shape `frame_aspect`.
+    pub fn target_aspect(&self, frame_aspect: f32) -> f32 {
+        let p = Self::clamped(self.place);
+        frame_aspect * (p[2] - p[0]) / (p[3] - p[1])
+    }
+
+    /// The crop actually used for an (iw, ih) picture going into a place of
+    /// `aspect` (w / h; see `target_aspect`): for Fill, trimmed to its shape.
     pub fn effective_crop(&self, iw: usize, ih: usize, aspect: f32) -> [f32; 4] {
         let [mut x0, mut y0, mut x1, mut y1] = Self::clamped(self.crop);
         if self.fit == FitMode::Fill {
@@ -404,17 +414,22 @@ pub fn frame_camera(img: &Frame, framing: &Framing, w: usize, h: usize) -> Frame
 }
 
 fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides: bool) -> Frame {
-    let [x0, y0, x1, y1] = framing.effective_crop(img.w, img.h, w as f32 / h as f32);
     let px = |v: f32, n: usize| ((v * n as f32).round().max(0.0) as usize).min(n);
+    // The place, in frame pixels.
+    let p = Framing::clamped(framing.place);
+    let (tx, ty) = (px(p[0], w).min(w - 1), px(p[1], h).min(h - 1));
+    let (tw, th) = ((px(p[2], w).max(tx + 1)) - tx, (px(p[3], h).max(ty + 1)) - ty);
+    let [x0, y0, x1, y1] = framing.effective_crop(img.w, img.h, tw as f32 / th as f32);
     let (cx, cy) = (px(x0, img.w).min(img.w - 1), px(y0, img.h).min(img.h - 1));
     let (cw, ch) = ((px(x1, img.w).max(cx + 1)) - cx, (px(y1, img.h).max(cy + 1)) - cy);
     let region = crop(img, cx, cy, cw, ch);
-    if framing.fit != FitMode::Fit {
-        return resize(&region, w, h);
-    }
-    let k = (w as f64 / cw as f64).min(h as f64 / ch as f64);
-    let fw = ((cw as f64 * k).round() as usize).clamp(1, w);
-    let fh = ((ch as f64 * k).round() as usize).clamp(1, h);
+    // The crop sized into the place (Fit: centred in it).
+    let (fw, fh) = if framing.fit == FitMode::Fit {
+        let k = (tw as f64 / cw as f64).min(th as f64 / ch as f64);
+        (((cw as f64 * k).round() as usize).clamp(1, tw), ((ch as f64 * k).round() as usize).clamp(1, th))
+    } else {
+        (tw, th)
+    };
     let fg = resize(&region, fw, fh);
     if (fw, fh) == (w, h) {
         return fg;
@@ -427,7 +442,7 @@ fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides:
     } else {
         Frame::new(w, h)
     };
-    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    let (ox, oy) = (tx + (tw - fw) / 2, ty + (th - fh) / 2);
     out.data[oy * w * 3..(oy + fh) * w * 3].par_chunks_mut(w * 3).enumerate().for_each(|(r, o)| {
         o[ox * 3..(ox + fw) * 3].copy_from_slice(&fg.data[r * fw * 3..][..fw * 3]);
     });
@@ -596,7 +611,7 @@ mod tests {
 
     #[test]
     fn framing_fill_keeps_frame_shape() {
-        let f = Framing { fit: FitMode::Fill, crop: Framing::WHOLE };
+        let f = Framing { fit: FitMode::Fill, ..Default::default() };
         let [x0, y0, x1, y1] = f.effective_crop(1000, 1000, 16.0 / 9.0);
         assert!((x0, x1) == (0.0, 1.0) && ((y1 - y0) - 0.5625).abs() < 1e-4 && ((y0 + y1) / 2.0 - 0.5).abs() < 1e-4);
         assert_eq!(Framing::clamped([0.9, 0.2, 1.3, 0.21])[2], 1.0);
@@ -608,15 +623,21 @@ mod tests {
     fn framing_sizes_and_letterbox() {
         let mut img = Frame::filled(400, 100, [200, 200, 200]);
         for fit in [FitMode::Fill, FitMode::Fit, FitMode::Stretch] {
-            let out = frame_background(&img, &Framing { fit, crop: [0.1, 0.0, 0.6, 1.0] }, 64, 36);
+            let out = frame_background(&img, &Framing { fit, crop: [0.1, 0.0, 0.6, 1.0], ..Default::default() }, 64, 36);
             assert_eq!((out.w, out.h), (64, 36));
         }
         // Fit: a square crop in a 16:9 frame keeps its middle untouched.
         img = Frame::filled(100, 100, [10, 20, 30]);
-        let out = frame_background(&img, &Framing { fit: FitMode::Fit, crop: Framing::WHOLE }, 64, 36);
+        let out = frame_background(&img, &Framing { fit: FitMode::Fit, ..Default::default() }, 64, 36);
         assert_eq!(&out.data[(18 * 64 + 32) * 3..][..3], &[10, 20, 30]);
-        let cam = frame_camera(&img, &Framing { fit: FitMode::Fit, crop: Framing::WHOLE }, 64, 36);
+        let cam = frame_camera(&img, &Framing { fit: FitMode::Fit, ..Default::default() }, 64, 36);
         assert_eq!((&cam.data[..3], &cam.data[(18 * 64 + 32) * 3..][..3]), (&[0, 0, 0][..], &[10, 20, 30][..]));
+        // Placed in the right half: the left half stays black.
+        let placed = Framing { place: [0.5, 0.0, 1.0, 1.0], ..Default::default() };
+        let cam = frame_camera(&img, &placed, 64, 36);
+        assert_eq!((&cam.data[(18 * 64 + 10) * 3..][..3], &cam.data[(18 * 64 + 48) * 3..][..3]),
+                   (&[0, 0, 0][..], &[10, 20, 30][..]));
+        assert!((placed.target_aspect(16.0 / 9.0) - 8.0 / 9.0).abs() < 1e-5);
         let c = crop(&img, 10, 20, 30, 40);
         assert_eq!((c.w, c.h), (30, 40));
     }

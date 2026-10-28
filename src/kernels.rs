@@ -194,10 +194,35 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Half-widths of OpenCV's 11x11 MORPH_ELLIPSE, row by row (dy = -5..=5).
 const ELLIPSE11: [usize; 11] = [0, 3, 4, 5, 5, 5, 5, 5, 4, 3, 0];
 
-/// Keep only the single largest person blob in an HxW matte, in place;
-/// suppress the rest while preserving the kept subject's soft edges.
+/// A component smaller than 1/MIN_SHARE of the largest is speckle or a stray
+/// fragment, never the subject, however close to the centre it sits.
+const MIN_SHARE: u32 = 10;
+
+/// The label (index into the per-component tables, zero where not a root) of
+/// the component whose centroid is nearest the frame centre, among those at
+/// least 1/MIN_SHARE the size of the largest; the first in label order on ties.
+fn pick_central(area: &[u32], sum2x: &[u64], sum2y: &[u64], h: usize, w: usize) -> usize {
+    let largest = area.iter().copied().max().unwrap_or(0);
+    let mut best = (0usize, f64::INFINITY);
+    for (l, &n) in area.iter().enumerate() {
+        if n == 0 || n * MIN_SHARE < largest {
+            continue;
+        }
+        // Centroid and centre, both doubled: sum2 / n against the frame size.
+        let dx = sum2x[l] as f64 / n as f64 - w as f64;
+        let dy = sum2y[l] as f64 / n as f64 - h as f64;
+        let d = dx * dx + dy * dy;
+        if d < best.1 {
+            best = (l, d);
+        }
+    }
+    best.0
+}
+
+/// Keep only the person blob nearest the frame centre in an HxW matte, in
+/// place; suppress the rest while preserving the kept subject's soft edges.
 /// Components are labelled at half resolution above 640 px (blobs are large).
-pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
+pub fn keep_central(a: &mut [f32], h: usize, w: usize) {
     assert_eq!(a.len(), h * w, "alpha must be HxW");
     // An exact 2x INTER_LINEAR downscale is the mean of each 2x2 block.
     let half = h.max(w) > 640;
@@ -253,7 +278,7 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
     // touch when their spans, widened by one pixel, overlap. The smaller run
     // index always wins a merge, so each root is the component's first pixel in
     // raster order -- the same order cv2.connectedComponents numbers them in,
-    // which keeps the tie-break ("first largest") identical.
+    // which keeps the tie-break (first in label order) well defined.
     let mut parent: Vec<u32> = (0..runs.len() as u32).collect();
     for y in 1..sh {
         let (prev, cur) = (row_at[y - 1]..row_at[y], row_at[y]..row_at[y + 1]);
@@ -275,19 +300,24 @@ pub fn keep_largest(a: &mut [f32], h: usize, w: usize) {
             }
         }
     }
+    // Per component: area and the sums of 2x+1 / 2y+1 over its pixels (twice
+    // the pixel-centre coordinates, so a run [s, e) adds exactly e^2 - s^2).
     let mut area = vec![0u32; runs.len()];
-    for (i, &(s, e)) in runs.iter().enumerate() {
-        let r = find(&mut parent, i as u32);
-        parent[i] = r;
-        area[r as usize] += e - s;
-    }
-    let mut biggest = 0usize;
-    for (l, &n) in area.iter().enumerate().skip(1) {
-        if n > area[biggest] {
-            biggest = l;
+    let mut sum2x = vec![0u64; runs.len()];
+    let mut sum2y = vec![0u64; runs.len()];
+    for y in 0..sh {
+        for i in row_at[y]..row_at[y + 1] {
+            let (s, e) = runs[i];
+            let r = find(&mut parent, i as u32);
+            parent[i] = r;
+            let r = r as usize;
+            area[r] += e - s;
+            sum2x[r] += e as u64 * e as u64 - s as u64 * s as u64;
+            sum2y[r] += (e - s) as u64 * (2 * y as u64 + 1);
         }
     }
-    let kept = |i: usize| parent[i] as usize == biggest;
+    let central = pick_central(&area, &sum2x, &sum2y, sh, sw);
+    let kept = |i: usize| parent[i] as usize == central;
 
     // The blob's bounding box: nothing outside it (+5 px of dilation) survives.
     let (mut x0, mut x1, mut y0, mut y1) = (sw, 0, sh, 0);
@@ -578,39 +608,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keep_largest_drops_small_blob() {
+    fn keep_central_drops_speck_near_centre() {
         let (h, w) = (40, 60);
         let mut a = vec![0f32; h * w];
         for y in 5..35 {
             for x in 5..30 {
-                a[y * w + x] = 1.0; // big blob
+                a[y * w + x] = 1.0; // big blob, left of centre
             }
         }
         for y in 10..14 {
             for x in 50..54 {
-                a[y * w + x] = 1.0; // small blob, > 5 px away
+                a[y * w + x] = 1.0; // speck, > 5 px away
             }
         }
-        keep_largest(&mut a, h, w);
+        keep_central(&mut a, h, w);
         assert_eq!(a[20 * w + 20], 1.0);
         assert_eq!(a[12 * w + 52], 0.0);
     }
 
+    #[test]
+    fn keep_central_prefers_centre_over_size() {
+        let (h, w) = (60, 120);
+        let mut a = vec![0f32; h * w];
+        for y in 0..60 {
+            for x in 0..30 {
+                a[y * w + x] = 1.0; // large person at the left edge
+            }
+        }
+        for y in 20..60 {
+            for x in 50..70 {
+                a[y * w + x] = 1.0; // smaller person in the middle
+            }
+        }
+        keep_central(&mut a, h, w);
+        assert_eq!(a[40 * w + 60], 1.0);
+        assert_eq!(a[30 * w + 10], 0.0);
+    }
+
     /// Pixel-by-pixel reference: 8-connected flood fill in raster order, keep
-    /// the first largest component, dilate it with the 11x11 ellipse.
-    fn keep_largest_reference(a: &mut [f32], h: usize, w: usize) {
+    /// the component nearest the centre, dilate it with the 11x11 ellipse.
+    fn keep_central_reference(a: &mut [f32], h: usize, w: usize) {
         let mut label = vec![0usize; h * w];
         let mut areas = vec![0usize];
+        let (mut sx, mut sy) = (vec![0u64], vec![0u64]);
         for start in 0..h * w {
             if a[start] <= 0.5 || label[start] != 0 {
                 continue;
             }
             let l = areas.len();
-            let (mut stack, mut n) = (vec![start], 0);
+            let (mut stack, mut n, mut px, mut py) = (vec![start], 0, 0u64, 0u64);
             label[start] = l;
             while let Some(i) = stack.pop() {
                 n += 1;
                 let (y, x) = ((i / w) as isize, (i % w) as isize);
+                px += 2 * x as u64 + 1;
+                py += 2 * y as u64 + 1;
                 for (dy, dx) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dy, dx))) {
                     let (ny, nx) = (y + dy, x + dx);
                     if ny < 0 || nx < 0 || ny >= h as isize || nx >= w as isize {
@@ -624,11 +676,14 @@ mod tests {
                 }
             }
             areas.push(n);
+            sx.push(px);
+            sy.push(py);
         }
         if areas.len() == 1 {
             return;
         }
-        let best = (1..areas.len()).fold(1, |b, l| if areas[l] > areas[b] { l } else { b });
+        let areas: Vec<u32> = areas.iter().map(|&n| n as u32).collect();
+        let best = pick_central(&areas, &sx, &sy, h, w);
         for y in 0..h {
             for x in 0..w {
                 let near = ELLIPSE11.iter().enumerate().any(|(j, &hw)| {
@@ -644,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_largest_matches_pixel_labelling() {
+    fn keep_central_matches_pixel_labelling() {
         let mut seed = 1u32;
         for (h, w, density) in [(37, 53, 0.45), (64, 64, 0.6), (40, 90, 0.3), (1, 30, 0.5), (25, 1, 0.5)] {
             let mut a = vec![0f32; h * w];
@@ -653,8 +708,8 @@ mod tests {
                 *v = if ((seed >> 8) as f32 / (1u32 << 24) as f32) < density { 0.9 } else { 0.1 };
             }
             let mut expect = a.clone();
-            keep_largest_reference(&mut expect, h, w);
-            keep_largest(&mut a, h, w);
+            keep_central_reference(&mut expect, h, w);
+            keep_central(&mut a, h, w);
             assert_eq!(a, expect, "{h}x{w} @ {density}");
         }
     }

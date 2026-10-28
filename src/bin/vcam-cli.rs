@@ -68,7 +68,7 @@ struct Args {
     /// Paste the background picture as-is (default: match it to your room's light, focus and grain)
     #[arg(long)]
     plain: bool,
-    /// Keep everyone in frame (default: keep only the single largest person)
+    /// Keep everyone in frame (default: keep only the single person nearest the centre)
     #[arg(long)]
     multi_person: bool,
     /// Horizontally flip (selfie view)

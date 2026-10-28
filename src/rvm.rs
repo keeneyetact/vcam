@@ -263,7 +263,7 @@ impl Pending {
                 };
                 let (mut alpha, fg) = kernels::guided_upsample(av, bv, ch, cw, &frame);
                 if single {
-                    kernels::keep_largest(&mut alpha, frame.h, frame.w);
+                    kernels::keep_central(&mut alpha, frame.h, frame.w);
                 }
                 Ok((alpha, fg))
             }
@@ -272,7 +272,7 @@ impl Pending {
                 let (h, w) = (shape[2] as usize, shape[3] as usize);
                 let mut alpha = p.to_vec();
                 if single {
-                    kernels::keep_largest(&mut alpha, h, w);
+                    kernels::keep_central(&mut alpha, h, w);
                 }
                 let (_, f) = fgr.try_extract_tensor::<f32>()?;
                 Ok((alpha, kernels::fgr_to_bgr(f, h, w)))
@@ -377,7 +377,7 @@ impl RvmEngine {
         self.dsr = dsr;
     }
 
-    /// Live toggle for keeping only the single largest person.
+    /// Live toggle for keeping only the person nearest the centre.
     pub fn set_single_person(&mut self, single: bool) {
         self.single = single;
     }

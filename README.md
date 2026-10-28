@@ -137,7 +137,7 @@ terminal.
 | `--auto-exposure` | off | Let the webcam's auto-exposure run (it can slow to ~20 fps in dim light; see Performance) |
 | `--brightness` | `0` | Picture brightness, -1 (darker) to 1 (brighter); moves shadows and midtones, keeps black and white |
 | `--plain` | off | Paste the background picture as-is (default: match it to your room's light, focus and grain) |
-| `--multi-person` | off | Keep everyone in frame (default: keep only the **single** largest person) |
+| `--multi-person` | off | Keep everyone in frame (default: keep only the **single** person nearest the centre) |
 | `--no-preview` | off | Don't open the preview window |
 | `--no-virtualcam` | off | Preview only; don't open a virtual camera |
 | `--list-cameras` | — | List the cameras and exit |
@@ -249,7 +249,7 @@ Intel iGPUs.
   stop it first.
 - **Too slow** → lower the edge detail (`--downsample 0.3`), or use the Smooth
   preset / a lower capture resolution.
-- **A second person/object shows up** → only the largest person is kept by
+- **A second person/object shows up** → only the person nearest the centre is kept by
   default; turn off *Only show one person* (`--multi-person` keeps everyone).
 
 ---

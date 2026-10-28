@@ -384,18 +384,33 @@ fn aligned_crop(c: [f32; 4], x: Option<i8>, y: Option<i8>) -> [f32; 4] {
     [x0, y0, x1, y1]
 }
 
+/// What a crop editor crops.
+#[derive(Clone, Debug, PartialEq)]
+enum CropTarget {
+    /// A background picture.
+    Picture(PathBuf),
+    /// The live camera picture.
+    Camera,
+}
+
 /// The crop editor window.
 struct CropEditor {
-    path: PathBuf,
-    /// The picture, downscaled, once it's loaded off the UI thread.
+    target: CropTarget,
+    /// The picture, downscaled: loaded off the UI thread, or the live camera.
     tex: Option<TextureHandle>,
     job: Option<mpsc::Receiver<Option<egui::ColorImage>>>,
+    /// The camera frame `tex` shows.
+    shown: Option<Arc<Frame>>,
     /// What's being dragged, the crop when the drag began, and where.
     drag: Option<(Grip, [f32; 4], Pos2)>,
 }
 
 impl CropEditor {
-    fn open(ctx: &egui::Context, path: PathBuf) -> Self {
+    fn camera() -> Self {
+        Self { target: CropTarget::Camera, tex: None, job: None, shown: None, drag: None }
+    }
+
+    fn picture(ctx: &egui::Context, path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
         let (src, ctx) = (path.clone(), ctx.clone());
         std::thread::spawn(move || {
@@ -408,7 +423,7 @@ impl CropEditor {
             let _ = tx.send(img);
             ctx.request_repaint();
         });
-        Self { path, tex: None, job: Some(rx), drag: None }
+        Self { target: CropTarget::Picture(path), tex: None, job: Some(rx), shown: None, drag: None }
     }
 }
 
@@ -427,6 +442,7 @@ pub struct App {
     mode: BgMode,
     bg_path: Option<PathBuf>,
     framings: HashMap<PathBuf, Framing>,
+    cam_framing: Framing,
     crop_edit: Option<CropEditor>,
     /// The picture tile waits for a crop drag / zoom to finish.
     tile_stale: bool,
@@ -522,6 +538,7 @@ impl App {
             mode,
             bg_path,
             framings: s.framings.clone(),
+            cam_framing: s.camera_framing,
             crop_edit: None,
             tile_stale: false,
             blur_image: s.blur_image,
@@ -577,6 +594,7 @@ impl App {
             mode: MODES.iter().find(|m| m.0 == self.mode).map_or("blur", |m| m.1).into(),
             bg_path: self.bg_path.clone(),
             framings: self.framings.clone(),
+            camera_framing: self.cam_framing,
             blur_image: self.blur_image,
             blur_strength: Some(self.blur as f64),
             realistic: self.realistic,
@@ -725,6 +743,24 @@ impl App {
         self.schedule_save();
     }
 
+    fn framing_of(&self, target: &CropTarget) -> Framing {
+        match target {
+            CropTarget::Camera => self.cam_framing,
+            CropTarget::Picture(_) => self.framing(),
+        }
+    }
+
+    fn set_framing_of(&mut self, ctx: &egui::Context, target: &CropTarget, f: Framing, dragging: bool) {
+        match target {
+            CropTarget::Camera => {
+                self.cam_framing = Framing { crop: Framing::clamped(f.crop), ..f };
+                self.worker.configure(|c| c.camera_framing = self.cam_framing); // live, from the next frame
+                self.schedule_save();
+            }
+            CropTarget::Picture(_) => self.set_framing(ctx, f, dragging),
+        }
+    }
+
     /// The output's shape (w / h): the camera's while running.
     fn frame_aspect(&self) -> f32 {
         self.worker.camera_info().map_or(16.0 / 9.0, |c| c.width as f32 / c.height.max(1) as f32)
@@ -789,6 +825,7 @@ impl App {
             c.mode = self.mode;
             c.bg_path = self.bg_path.clone();
             c.framing = self.framing();
+            c.camera_framing = self.cam_framing;
             c.blur_image = self.blur_image;
             c.blur_strength = self.blur;
             c.realistic = self.realistic;
@@ -1241,6 +1278,8 @@ impl App {
             self.schedule_save();
         }
         ui.add_space(6.0);
+        self.ui_framing(ui, &ctx, CropTarget::Camera);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Brightness").on_hover_text(
                 "Darkens or brightens the picture's shadows and midtones; black and white stay as they are. \
@@ -1316,7 +1355,9 @@ impl App {
                 self.apply_bg(&ctx);
             }
             ui.add_space(6.0);
-            self.ui_framing(ui, &ctx);
+            if let Some(path) = self.bg_path.clone() {
+                self.ui_framing(ui, &ctx, CropTarget::Picture(path));
+            }
         }
         if self.mode == BgMode::Blur || (self.mode == BgMode::Image && self.blur_image) {
             ui.add_space(6.0);
@@ -1374,42 +1415,69 @@ impl App {
         picked
     }
 
-    /// How the picture is fitted, and the way into the crop editor.
-    fn ui_framing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// How the camera / picture is fitted, and the way into its crop editor.
+    fn ui_framing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, target: CropTarget) {
         let p = self.pal();
-        let f = self.framing();
+        let f = self.framing_of(&target);
+        let camera = target == CropTarget::Camera;
         let mut open = false;
         ui.horizontal(|ui| {
-            ui.label("Framing");
+            ui.label(if camera { "Camera framing" } else { "Framing" });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let text = if f.crop == Framing::WHOLE { "Crop…" } else { "Edit crop…" };
                 open = Self::link(ui, p, text)
-                    .on_hover_text("Choose the part of the picture to use: move, resize or zoom the crop.")
+                    .on_hover_text(if camera {
+                        "Choose the part of the camera picture to use (a digital zoom); only that part is \
+                         processed. Move, resize or zoom the crop."
+                    } else {
+                        "Choose the part of the picture to use: move, resize or zoom the crop."
+                    })
                     .clicked();
             });
         });
         if let Some(fit) = Self::fit_tiles(ui, p, f.fit) {
-            self.set_framing(ctx, Framing { fit, ..f }, false);
+            self.set_framing_of(ctx, &target, Framing { fit, ..f }, false);
         }
-        if open && self.crop_edit.is_none() {
-            if let Some(path) = self.bg_path.clone() {
-                self.crop_edit = Some(CropEditor::open(ctx, path));
-            }
+        if open && self.crop_edit.as_ref().is_none_or(|e| e.target != target) {
+            self.crop_edit = Some(match target {
+                CropTarget::Camera => CropEditor::camera(),
+                CropTarget::Picture(path) => CropEditor::picture(ctx, path),
+            });
         }
     }
 
-    /// The crop editor window: the whole picture with the crop on top. Every
-    /// change shows live in the preview.
+    /// The crop editor window: the whole picture (or live camera picture)
+    /// with the crop on top. Every change shows live in the preview.
     fn ui_crop_editor(&mut self, ctx: &egui::Context) {
+        self.worker.want_raw(self.crop_edit.as_ref().is_some_and(|e| e.target == CropTarget::Camera));
         let Some(mut ed) = self.crop_edit.take() else { return };
-        // It follows the chosen picture, and closes when there's none.
-        match self.bg_path.clone() {
-            Some(path) if self.mode == BgMode::Image => {
-                if path != ed.path {
-                    ed = CropEditor::open(ctx, path);
+        match &ed.target {
+            // A picture editor follows the chosen picture, and closes when
+            // there's none.
+            CropTarget::Picture(shown) => match self.bg_path.clone() {
+                Some(path) if self.mode == BgMode::Image => {
+                    if path != *shown {
+                        ed = CropEditor::picture(ctx, path);
+                    }
                 }
+                _ => return,
+            },
+            CropTarget::Camera => {
+                let raw = self.worker.latest_raw();
+                if let Some(frame) = raw.as_ref().filter(|r| !ed.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, r))) {
+                    let k = (EDITOR_PX as f32 / 1.6 / frame.w.max(frame.h) as f32).min(1.0);
+                    let (w, h) = (((frame.w as f32 * k) as usize).max(1), ((frame.h as f32 * k) as usize).max(1));
+                    let img = egui::ColorImage::from_rgb([w, h], &imgproc::make_preview(frame, w, h));
+                    match &mut ed.tex {
+                        Some(t) => t.set(img, TextureOptions::LINEAR),
+                        None => ed.tex = Some(texture(ctx, "crop-camera", img)),
+                    }
+                }
+                if raw.is_none() {
+                    ed.tex = None;
+                }
+                ed.shown = raw;
             }
-            _ => return,
         }
         if let Some(rx) = &ed.job {
             match rx.try_recv() {
@@ -1423,11 +1491,12 @@ impl App {
         }
         let p = self.pal();
         let aspect = self.frame_aspect();
-        let mut f = self.framing();
+        let mut f = self.framing_of(&ed.target);
+        let camera = ed.target == CropTarget::Camera;
         let mut changed: Option<bool> = None; // Some(still dragging)
         let mut open = !ctx.input(|i| i.key_pressed(Key::Escape));
         let mut done = false;
-        egui::Window::new("Crop & position")
+        egui::Window::new(if camera { "Crop camera" } else { "Crop & position" })
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1442,7 +1511,12 @@ impl App {
                 }
                 ui.add_space(6.0);
                 let Some(tex) = ed.tex.clone() else {
-                    ui.add_sized(vec2(box_size.x, box_size.y * 0.8), egui::Spinner::new());
+                    let size = vec2(box_size.x, box_size.y * 0.8);
+                    if camera {
+                        ui.add_sized(size, egui::Label::new(RichText::new("Start the camera to see it here.").color(p.muted)));
+                    } else {
+                        ui.add_sized(size, egui::Spinner::new());
+                    }
                     return;
                 };
                 let [iw, ih] = tex.size();
@@ -1576,10 +1650,12 @@ impl App {
                 });
             });
         if let Some(dragging) = changed {
-            self.set_framing(ctx, f, dragging);
+            self.set_framing_of(ctx, &ed.target, f, dragging);
         }
         if open && !done {
             self.crop_edit = Some(ed);
+        } else if camera {
+            self.worker.want_raw(false);
         } else if self.tile_stale {
             self.tile_stale = false;
             self.render_thumbs(ctx);

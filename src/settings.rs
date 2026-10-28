@@ -23,6 +23,8 @@ pub struct Settings {
     pub bg_path: Option<PathBuf>,
     /// Each picture's crop and fit, by path.
     pub framings: HashMap<PathBuf, Framing>,
+    /// The camera picture's crop and fit.
+    pub camera_framing: Framing,
     pub blur_image: bool,
     pub blur_strength: Option<f64>,
     pub realistic: bool,
@@ -56,6 +58,7 @@ impl Settings {
                 .and_then(Value::as_object)
                 .map(|o| o.iter().filter_map(|(k, v)| Some((PathBuf::from(k), framing_from(v)?))).collect())
                 .unwrap_or_default(),
+            camera_framing: m.get("camera_framing").and_then(framing_from).unwrap_or_default(),
             blur_image: b("blur_image", false),
             blur_strength: m.get("blur_strength").and_then(Value::as_f64),
             realistic: b("realistic", false),
@@ -84,6 +87,7 @@ impl Settings {
                 .iter()
                 .map(|(p, f)| (p.to_string_lossy().into_owned(), framing_to(f)))
                 .collect::<Map<String, Value>>(),
+            "camera_framing": framing_to(&self.camera_framing),
             "blur_image": self.blur_image,
             "blur_strength": self.blur_strength.map(|v| (v * 1000.0).round() / 1000.0),
             "realistic": self.realistic,

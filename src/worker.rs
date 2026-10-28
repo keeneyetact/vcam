@@ -50,6 +50,9 @@ pub struct Config {
     pub bg_path: Option<PathBuf>,
     /// Which part of the picture is used, and how it's fitted.
     pub framing: Framing,
+    /// Which part of the camera picture is processed (a digital zoom), and
+    /// how it's fitted to the frame.
+    pub camera_framing: Framing,
     /// Solid colour background, BGR.
     pub color: [u8; 3],
     /// Soften the picture background (out-of-focus look).
@@ -86,6 +89,7 @@ impl Default for Config {
             mode: BgMode::Image,
             bg_path: None,
             framing: Framing::default(),
+            camera_framing: Framing::default(),
             color: [64, 177, 0],
             blur_image: false,
             blur_strength: 1.0,
@@ -170,6 +174,10 @@ struct Shared {
     /// while minimized).
     preview_box: Mutex<Option<(usize, usize)>>,
     latest: Mutex<(Option<Arc<Frame>>, Option<Arc<Preview>>)>,
+    /// The camera picture before its crop, kept only while `want_raw` (the
+    /// GUI's camera crop editor shows it).
+    want_raw: AtomicBool,
+    latest_raw: Mutex<Option<Arc<Frame>>>,
     on_preview: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -194,6 +202,8 @@ impl VCamWorker {
             restart: AtomicBool::new(false),
             preview_box: Mutex::new(None),
             latest: Mutex::new((None, None)),
+            want_raw: AtomicBool::new(false),
+            latest_raw: Mutex::new(None),
             on_preview: Mutex::new(None),
         };
         Self { shared: Arc::new(shared), thread: Mutex::new(None) }
@@ -283,6 +293,19 @@ impl VCamWorker {
         self.shared.info.lock().unwrap().camera.clone()
     }
 
+    /// Keep the camera picture before its crop, for `latest_raw`.
+    pub fn want_raw(&self, on: bool) {
+        if !self.shared.want_raw.swap(on, Ordering::Relaxed) || on {
+            return;
+        }
+        *self.shared.latest_raw.lock().unwrap() = None;
+    }
+
+    /// The latest camera picture (mirrored and brightened) before its crop.
+    pub fn latest_raw(&self) -> Option<Arc<Frame>> {
+        self.shared.latest_raw.lock().unwrap().clone()
+    }
+
     pub fn latest_frame(&self) -> Option<Arc<Frame>> {
         self.shared.latest.lock().unwrap().0.clone()
     }
@@ -361,6 +384,7 @@ fn thread_main(sh: &Arc<Shared>) {
     info.camera = None;
     drop(info);
     *sh.latest.lock().unwrap() = (None, None);
+    *sh.latest_raw.lock().unwrap() = None;
 }
 
 fn fitted_background(sh: &Shared, path: &Path, framing: &Framing, w: usize, h: usize) -> Result<Arc<Frame>> {
@@ -548,7 +572,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             continue;
         };
         last_seq = seq;
-        let (load, mirror, bright, want_dsr, multi) = {
+        let (load, mirror, bright, want_dsr, multi, cam_framing) = {
             let mut bg = sh.bg.lock().unwrap();
             let cfg = sh.cfg.lock().unwrap();
             let mut load = None;
@@ -561,7 +585,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             if let Some(c) = bg.pending.take() {
                 compositor = c;
             }
-            (load, cfg.mirror, cfg.brightness, cfg.downsample, cfg.multi_person)
+            (load, cfg.mirror, cfg.brightness, cfg.downsample, cfg.multi_person, cfg.camera_framing)
         };
         if let Some((gen, c)) = load {
             load_compositor_async(sh, gen, c, w, h);
@@ -575,6 +599,16 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         let curve = lut.as_ref().filter(|_| adjust).map(|l| &l.1);
         let frame = if mirror || curve.is_some() {
             Arc::new(kernels::pool().install(|| frame.adjusted(mirror, curve)))
+        } else {
+            frame
+        };
+        if sh.want_raw.load(Ordering::Relaxed) {
+            *sh.latest_raw.lock().unwrap() = Some(frame.clone());
+        }
+        // The camera crop, resized back to the capture size: the engine and
+        // background keep their size, so it changes live (~1 ms at 720p).
+        let frame = if cam_framing != Framing::default() {
+            Arc::new(kernels::pool().install(|| imgproc::frame_camera(&frame, &cam_framing, w, h)))
         } else {
             frame
         };

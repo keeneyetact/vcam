@@ -390,8 +390,20 @@ impl Framing {
     }
 }
 
-/// Crop `img` as `framing` says and lay it into a (w, h) frame.
+/// Crop `img` as `framing` says and lay it into a (w, h) frame; Fit's empty
+/// sides are a blurred copy of the crop.
 pub fn frame_background(img: &Frame, framing: &Framing, w: usize, h: usize) -> Frame {
+    frame_with(img, framing, w, h, true)
+}
+
+/// The same for the camera picture, but Fit's empty sides are black: no
+/// copies of the person for the matting to pick up, so the background fills
+/// them.
+pub fn frame_camera(img: &Frame, framing: &Framing, w: usize, h: usize) -> Frame {
+    frame_with(img, framing, w, h, false)
+}
+
+fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides: bool) -> Frame {
     let [x0, y0, x1, y1] = framing.effective_crop(img.w, img.h, w as f32 / h as f32);
     let px = |v: f32, n: usize| ((v * n as f32).round().max(0.0) as usize).min(n);
     let (cx, cy) = (px(x0, img.w).min(img.w - 1), px(y0, img.h).min(img.h - 1));
@@ -407,10 +419,14 @@ pub fn frame_background(img: &Frame, framing: &Framing, w: usize, h: usize) -> F
     if (fw, fh) == (w, h) {
         return fg;
     }
-    // The empty sides: the same crop, filled and heavily blurred (blurred
-    // small, so it costs next to nothing).
-    let small = resize_cover(&region, (w / 8).max(1), (h / 8).max(1));
-    let mut out = resize_linear(&gaussian_blur(&small, 3.0), w, h);
+    let mut out = if blurred_sides {
+        // The same crop, filled and heavily blurred (blurred small, so it
+        // costs next to nothing).
+        let small = resize_cover(&region, (w / 8).max(1), (h / 8).max(1));
+        resize_linear(&gaussian_blur(&small, 3.0), w, h)
+    } else {
+        Frame::new(w, h)
+    };
     let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
     out.data[oy * w * 3..(oy + fh) * w * 3].par_chunks_mut(w * 3).enumerate().for_each(|(r, o)| {
         o[ox * 3..(ox + fw) * 3].copy_from_slice(&fg.data[r * fw * 3..][..fw * 3]);
@@ -599,6 +615,8 @@ mod tests {
         img = Frame::filled(100, 100, [10, 20, 30]);
         let out = frame_background(&img, &Framing { fit: FitMode::Fit, crop: Framing::WHOLE }, 64, 36);
         assert_eq!(&out.data[(18 * 64 + 32) * 3..][..3], &[10, 20, 30]);
+        let cam = frame_camera(&img, &Framing { fit: FitMode::Fit, crop: Framing::WHOLE }, 64, 36);
+        assert_eq!((&cam.data[..3], &cam.data[(18 * 64 + 32) * 3..][..3]), (&[0, 0, 0][..], &[10, 20, 30][..]));
         let c = crop(&img, 10, 20, 30, 40);
         assert_eq!((c.w, c.h), (30, 40));
     }

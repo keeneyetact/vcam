@@ -1,5 +1,6 @@
-//! Build script: embeds the RVM model into the binary when it's present at
-//! build time (so the exe needs no download), and sets the exe icon.
+//! Build script: embeds the RVM and face-detection models into the binary
+//! when they're present at build time (so the exe needs no download), and
+//! sets the exe icon.
 
 use std::path::Path;
 
@@ -16,6 +17,15 @@ fn main() {
             "cargo:warning=models/rvm_mobilenetv3_fp32.onnx not found: the exe will \
              download the RVM model on first run instead of bundling it"
         );
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(embedded_face_model)");
+    let face = Path::new("models/face_detection_yunet_2023mar.onnx");
+    println!("cargo:rerun-if-changed={}", face.display());
+    if face.is_file() {
+        let abs = face.canonicalize().expect("face model path");
+        println!("cargo:rustc-cfg=embedded_face_model");
+        println!("cargo:rustc-env=VCAM_EMBEDDED_FACE_MODEL={}", abs.display());
     }
 
     println!("cargo:rerun-if-changed=assets/icon.ico");

@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
+use crate::faces::Face;
 use crate::imgproc::{reflect101, Frame, BYTES, FLOATS, U32S};
 
 const INV255: f32 = 1.0 / 255.0;
@@ -219,16 +220,58 @@ fn pick_central(area: &[u32], sum2x: &[u64], sum2y: &[u64], h: usize, w: usize) 
     best.0
 }
 
-/// Keep only the person blob nearest the frame centre in an HxW matte, in
-/// place; suppress the rest while preserving the kept subject's soft edges.
-/// Components are labelled at half resolution above 640 px (blobs are large).
-pub fn keep_central(a: &mut [f32], h: usize, w: usize) {
+/// How much nearer the centre another face must be to take over from the one
+/// kept last frame, as a fraction of the frame width (stops flip-flopping).
+const STICKINESS: f32 = 0.08;
+/// Vertical distances count this much (squared) when splitting a blob between
+/// two faces: bodies hang below heads, so the cut leans towards vertical.
+const CUT_VERTICAL: f32 = 0.1;
+/// Width of the soft edge along a cut, as a fraction of the kept face width.
+const CUT_SOFTNESS: f32 = 0.25;
+
+/// A straight cut through a blob shared by two people: alpha is kept where
+/// `(x - mx) * nx + (y - my) * ny` is negative, fading out over `soft` px.
+struct Cut {
+    mx: f32,
+    my: f32,
+    nx: f32,
+    ny: f32,
+    soft: f32,
+}
+
+impl Cut {
+    /// Between the kept face `t` and another face `f`, nearer `t` the
+    /// smaller its face is.
+    fn between(t: &Face, f: &Face) -> Cut {
+        let k = t.w / (t.w + f.w);
+        let (mx, my) = (t.x + (f.x - t.x) * k, t.y + (f.y - t.y) * k);
+        let (nx, ny) = (f.x - t.x, (f.y - t.y) * CUT_VERTICAL);
+        let len = nx.hypot(ny).max(1e-6);
+        Cut { mx, my, nx: nx / len, ny: ny / len, soft: (t.w * CUT_SOFTNESS).max(1.0) }
+    }
+
+    #[inline]
+    fn weight(&self, x: f32, y: f32) -> f32 {
+        (0.5 - ((x - self.mx) * self.nx + (y - self.my) * self.ny) / self.soft).clamp(0.0, 1.0)
+    }
+}
+
+/// Keep only one person in an HxW matte, in place; suppress the rest while
+/// preserving the kept subject's soft edges. Components are labelled at half
+/// resolution above 640 px (blobs are large).
+///
+/// With `faces` (frame pixels), the person is the face on the matte nearest
+/// the frame centre -- favouring `prev`, the one kept last time -- and if
+/// other faces share its blob (people touching), the blob is cut between
+/// them. Without, it's the blob nearest the centre. Returns the face kept, or
+/// `prev` when no face was usable.
+pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Option<[f32; 2]>) -> Option<[f32; 2]> {
     assert_eq!(a.len(), h * w, "alpha must be HxW");
     // An exact 2x INTER_LINEAR downscale is the mean of each 2x2 block.
     let half = h.max(w) > 640;
     let (sh, sw) = if half { (h / 2, w / 2) } else { (h, w) };
     if sh == 0 || sw == 0 {
-        return;
+        return prev;
     }
     let mut bin = BYTES.scratch(sh * sw);
     {
@@ -271,7 +314,7 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize) {
     }
     BYTES.give(bin);
     if runs.is_empty() {
-        return; // nothing detected; leave the matte as-is
+        return prev; // nothing detected; leave the matte as-is
     }
 
     // 8-connected components over the runs, union-find: runs in adjacent rows
@@ -316,7 +359,41 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize) {
             sum2y[r] += (e - s) as u64 * (2 * y as u64 + 1);
         }
     }
-    let central = pick_central(&area, &sum2x, &sum2y, sh, sw);
+
+    // Faces on the matte, with their blob: the run under the face centre, or
+    // failing that under the chin. A face off the matte (a poster, a TV) or on
+    // a speck doesn't count.
+    let largest = area.iter().copied().max().unwrap_or(0);
+    let blob_at = |x: f32, y: f32| -> Option<usize> {
+        let (x, y) = (x * sw as f32 / w as f32, y * sh as f32 / h as f32);
+        if !(0.0..sw as f32).contains(&x) || !(0.0..sh as f32).contains(&y) {
+            return None;
+        }
+        let (x, y) = (x as u32, y as usize);
+        let i = (row_at[y]..row_at[y + 1]).find(|&i| runs[i].0 <= x && x < runs[i].1)?;
+        let l = parent[i] as usize;
+        (area[l] * MIN_SHARE >= largest).then_some(l)
+    };
+    let on: Vec<(&Face, usize)> = faces
+        .iter()
+        .filter_map(|f| Some((f, blob_at(f.x, f.y).or_else(|| blob_at(f.x, f.y + 0.6 * f.h))?)))
+        .collect();
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let target = on.iter().copied().min_by(|(f, _), (g, _)| {
+        let d = |f: &Face| {
+            let sticky = prev.is_some_and(|[px, py]| (f.x - px).hypot(f.y - py) < f.w);
+            (f.x - cx).hypot(f.y - cy) - if sticky { STICKINESS * w as f32 } else { 0.0 }
+        };
+        d(f).total_cmp(&d(g))
+    });
+    let (central, cuts, kept_face) = match target {
+        Some((t, l)) => {
+            let cuts: Vec<Cut> =
+                on.iter().filter(|&&(f, m)| m == l && !std::ptr::eq(f, t)).map(|(f, _)| Cut::between(t, f)).collect();
+            (l, cuts, Some([t.x, t.y]))
+        }
+        None => (pick_central(&area, &sum2x, &sum2y, sh, sw), Vec::new(), prev),
+    };
     let kept = |i: usize| parent[i] as usize == central;
 
     // The blob's bounding box: nothing outside it (+5 px of dilation) survives.
@@ -373,19 +450,24 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize) {
     U32S.give(pre);
 
     // Zero the matte outside the dilated blob, mapping each full-res pixel to its
-    // nearest low-res one (INTER_NEAREST upscale).
+    // nearest low-res one (INTER_NEAREST upscale), and fade it out across cuts.
     let xmap: Vec<usize> = (0..w).map(|xx| xx * sw / w).collect();
     pool().install(|| {
         a.par_chunks_mut(w).enumerate().for_each(|(yy, row)| {
             let krow = &keep[(yy * sh / h) * sw..][..sw];
-            for (v, &sx) in row.iter_mut().zip(&xmap) {
+            for (xx, (v, &sx)) in row.iter_mut().zip(&xmap).enumerate() {
                 if krow[sx] == 0 {
                     *v = 0.0;
+                } else if *v > 0.0 {
+                    for c in &cuts {
+                        *v *= c.weight(xx as f32 + 0.5, yy as f32 + 0.5);
+                    }
                 }
             }
         });
     });
     BYTES.give(keep);
+    kept_face
 }
 
 // --------------------------------------------------------------------------- //
@@ -621,7 +703,7 @@ mod tests {
                 a[y * w + x] = 1.0; // speck, > 5 px away
             }
         }
-        keep_central(&mut a, h, w);
+        keep_central(&mut a, h, w, &[], None);
         assert_eq!(a[20 * w + 20], 1.0);
         assert_eq!(a[12 * w + 52], 0.0);
     }
@@ -640,9 +722,61 @@ mod tests {
                 a[y * w + x] = 1.0; // smaller person in the middle
             }
         }
-        keep_central(&mut a, h, w);
+        keep_central(&mut a, h, w, &[], None);
         assert_eq!(a[40 * w + 60], 1.0);
         assert_eq!(a[30 * w + 10], 0.0);
+    }
+
+    fn face(x: f32, y: f32, size: f32) -> Face {
+        Face { x, y, w: size, h: size, score: 0.9 }
+    }
+
+    /// Two people shoulder to shoulder: one blob, two heads.
+    fn two_touching(h: usize, w: usize) -> Vec<f32> {
+        let mut a = vec![0f32; h * w];
+        for y in 0..h {
+            for x in 0..w {
+                let head = |cx: usize| (x as isize - cx as isize).pow(2) + (y as isize - 25).pow(2) <= 15 * 15;
+                if head(70) || head(140) || (y >= 40 && (30..180).contains(&x)) {
+                    a[y * w + x] = 1.0;
+                }
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn keep_central_cuts_between_touching_people() {
+        let (h, w) = (120, 200);
+        let mut a = two_touching(h, w);
+        let faces = [face(70.0, 25.0, 30.0), face(140.0, 25.0, 30.0)];
+        // Face 70 is nearer the centre (100).
+        let kept = keep_central(&mut a, h, w, &faces, None);
+        assert_eq!(kept, Some([70.0, 25.0]));
+        assert_eq!(a[25 * w + 70], 1.0, "kept head");
+        assert_eq!(a[100 * w + 40], 1.0, "kept body");
+        assert_eq!(a[25 * w + 140], 0.0, "other head");
+        assert_eq!(a[100 * w + 160], 0.0, "other body");
+        // The cut sits halfway between equal faces, with a soft edge.
+        assert!(a[100 * w + 105] > 0.0 && a[100 * w + 105] < 1.0);
+    }
+
+    #[test]
+    fn keep_central_sticks_with_previous_face() {
+        let (h, w) = (120, 200);
+        let faces = [face(70.0, 25.0, 30.0), face(140.0, 25.0, 30.0)];
+        // The right face is only a little nearer the centre than the left...
+        let near = [face(62.0, 25.0, 30.0), face(132.0, 25.0, 30.0)];
+        let mut a = two_touching(h, w);
+        assert_eq!(keep_central(&mut a, h, w, &near, None), Some([132.0, 25.0]));
+        // ...so if the left one was kept last time, it stays.
+        let mut a = two_touching(h, w);
+        assert_eq!(keep_central(&mut a, h, w, &near, Some([60.0, 25.0])), Some([62.0, 25.0]));
+        assert_eq!(a[25 * w + 140], 0.0);
+        // A face off the matte (a poster) is ignored.
+        let mut a = two_touching(h, w);
+        let kept = keep_central(&mut a, h, w, &[face(100.0, 5.0, 10.0), faces[0]], None);
+        assert_eq!(kept, Some([70.0, 25.0]));
     }
 
     /// Pixel-by-pixel reference: 8-connected flood fill in raster order, keep
@@ -709,7 +843,7 @@ mod tests {
             }
             let mut expect = a.clone();
             keep_central_reference(&mut expect, h, w);
-            keep_central(&mut a, h, w);
+            keep_central(&mut a, h, w, &[], None);
             assert_eq!(a, expect, "{h}x{w} @ {density}");
         }
     }

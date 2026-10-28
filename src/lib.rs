@@ -14,6 +14,7 @@ compile_error!("vcam targets Windows (Media Foundation capture + the OBS Virtual
 
 pub mod capture;
 pub mod compositor;
+pub mod faces;
 pub mod imgproc;
 pub mod kernels;
 pub mod look;

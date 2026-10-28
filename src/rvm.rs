@@ -16,6 +16,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionInputValue};
 use ort::value::{DynValue, Tensor};
 
+use crate::faces::{Face, FaceTracker};
 use crate::imgproc::Frame;
 use crate::kernels;
 use crate::models::{self, REC_IN, TRUNK_OUTPUTS};
@@ -242,10 +243,24 @@ enum Backend {
     Full { sess: Session, rec: Option<Vec<DynValue>>, rec_dsr: f32 },
 }
 
+/// Single-person mode's inputs for one frame: the newest faces, and the face
+/// kept last frame (shared, as frames finish on another thread).
+pub struct Single {
+    faces: Arc<Vec<Face>>,
+    kept: Arc<Mutex<Option<[f32; 2]>>>,
+}
+
+impl Single {
+    fn apply(&self, alpha: &mut [f32], h: usize, w: usize) {
+        let mut kept = self.kept.lock().unwrap();
+        *kept = kernels::keep_central(alpha, h, w, &self.faces, *kept);
+    }
+}
+
 /// One frame's inference in flight; `finish` turns it into (alpha, foreground).
 pub enum Pending {
-    Staged { rx: Receiver<Result<AB>>, frame: Arc<Frame>, single: bool },
-    Full { fgr: DynValue, pha: DynValue, single: bool },
+    Staged { rx: Receiver<Result<AB>>, frame: Arc<Frame>, single: Option<Single> },
+    Full { fgr: DynValue, pha: DynValue, single: Option<Single> },
 }
 
 impl Pending {
@@ -262,8 +277,8 @@ impl Pending {
                     _ => bail!("unexpected guided-filter coefficient shape {shape:?}"),
                 };
                 let (mut alpha, fg) = kernels::guided_upsample(av, bv, ch, cw, &frame);
-                if single {
-                    kernels::keep_central(&mut alpha, frame.h, frame.w);
+                if let Some(s) = single {
+                    s.apply(&mut alpha, frame.h, frame.w);
                 }
                 Ok((alpha, fg))
             }
@@ -271,8 +286,8 @@ impl Pending {
                 let (shape, p) = pha.try_extract_tensor::<f32>()?;
                 let (h, w) = (shape[2] as usize, shape[3] as usize);
                 let mut alpha = p.to_vec();
-                if single {
-                    kernels::keep_central(&mut alpha, h, w);
+                if let Some(s) = single {
+                    s.apply(&mut alpha, h, w);
                 }
                 let (_, f) = fgr.try_extract_tensor::<f32>()?;
                 Ok((alpha, kernels::fgr_to_bgr(f, h, w)))
@@ -289,6 +304,9 @@ pub struct RvmEngine {
     pub threads: usize,
     pub single: bool,
     backend: Backend,
+    /// Started the first time single-person mode is used.
+    faces: Option<FaceTracker>,
+    kept: Arc<Mutex<Option<[f32; 2]>>>,
 }
 
 impl RvmEngine {
@@ -316,7 +334,7 @@ impl RvmEngine {
                 Backend::Full { sess: build_session(&path, threads)?, rec: None, rec_dsr: dsr }
             }
         };
-        Ok(Self { w, h, dsr, threads, single: single_person, backend })
+        Ok(Self { w, h, dsr, threads, single: single_person, backend, faces: None, kept: Arc::default() })
     }
 
     pub fn staged(&self) -> bool {
@@ -328,6 +346,7 @@ impl RvmEngine {
     /// run on another thread, so the next inference starts while this frame is
     /// still being post-processed.
     pub fn infer(&mut self, frame: Arc<Frame>) -> Result<Pending> {
+        let single = self.single_for(&frame);
         let n = 3 * frame.h * frame.w;
         let shape = [1i64, 3, frame.h as i64, frame.w as i64];
         match &mut self.backend {
@@ -340,7 +359,7 @@ impl RvmEngine {
                 };
                 kernels::fill_src(&frame, src.extract_tensor_mut().1);
                 let rx = pipe.submit(src, pool_tx.clone(), self.dsr)?;
-                Ok(Pending::Staged { rx, frame, single: self.single })
+                Ok(Pending::Staged { rx, frame, single })
             }
             Backend::Full { sess, rec, rec_dsr } => {
                 let mut src = vec![0f32; n];
@@ -361,9 +380,23 @@ impl RvmEngine {
                 let new_rec = models::REC_OUT.iter().map(|n| take(&mut out, n)).collect::<Result<Vec<_>>>()?;
                 drop(out);
                 *rec = Some(new_rec);
-                Ok(Pending::Full { fgr, pha, single: self.single })
+                Ok(Pending::Full { fgr, pha, single })
             }
         }
+    }
+
+    fn single_for(&mut self, frame: &Arc<Frame>) -> Option<Single> {
+        if !self.single {
+            return None;
+        }
+        if self.faces.is_none() {
+            match FaceTracker::start() {
+                Ok(t) => self.faces = Some(t),
+                Err(e) => crate::log!("Could not start face detection: {e:#}"),
+            }
+        }
+        let faces = self.faces.as_mut().map_or_else(Default::default, |t| t.offer(frame));
+        Some(Single { faces, kept: self.kept.clone() })
     }
 
     pub fn process(&mut self, frame: Arc<Frame>) -> Result<(Vec<f32>, Frame)> {
@@ -403,7 +436,16 @@ mod tests {
         for (p, b) in stage_paths.iter().zip(models::build_stages(&bytes)?) {
             std::fs::write(p, b)?;
         }
-        let engine = |backend| RvmEngine { w, h, dsr: 0.375, threads: 4, single: false, backend };
+        let engine = |backend| RvmEngine {
+            w,
+            h,
+            dsr: 0.375,
+            threads: 4,
+            single: false,
+            backend,
+            faces: None,
+            kept: Arc::default(),
+        };
         let (pool_tx, pool_rx) = mpsc::channel();
         let mut staged = engine(Backend::Staged { pipe: StagePipeline::new(&stage_paths, [2, 4, 4])?, pool_tx, pool_rx });
         let mut full = engine(Backend::Full { sess: build_session(&full_path, 4)?, rec: None, rec_dsr: 0.375 });

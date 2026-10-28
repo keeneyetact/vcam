@@ -32,10 +32,21 @@ pub const STAGE_FILES: [&str; 3] = [
     "rvm_mobilenetv3_fp32_tail.onnx",
 ];
 
+/// YuNet face detector (OpenCV Zoo, MIT), for telling people apart in
+/// single-person mode. Fixed 640x640 input; ~230 KB.
+pub const FACE_FILE: &str = "face_detection_yunet_2023mar.onnx";
+pub const FACE_URL: &str =
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx";
+
 #[cfg(embedded_model)]
 const EMBEDDED: Option<&[u8]> = Some(include_bytes!(env!("VCAM_EMBEDDED_MODEL")));
 #[cfg(not(embedded_model))]
 const EMBEDDED: Option<&[u8]> = None;
+
+#[cfg(embedded_face_model)]
+const EMBEDDED_FACE: Option<&[u8]> = Some(include_bytes!(env!("VCAM_EMBEDDED_FACE_MODEL")));
+#[cfg(not(embedded_face_model))]
+const EMBEDDED_FACE: Option<&[u8]> = None;
 
 pub fn find_model(file: &str) -> Option<PathBuf> {
     paths::model_dirs()
@@ -63,12 +74,27 @@ pub fn rvm_model_bytes() -> Result<Vec<u8>> {
     if let Some(p) = find_model(RVM_FILE) {
         return Ok(std::fs::read(p)?);
     }
-    let path = paths::writable_model_dir().join(RVM_FILE);
-    crate::log!("Downloading RobustVideoMatting model -> {} ...", path.display());
-    let bytes = ureq::get(RVM_URL)
+    download("RobustVideoMatting", RVM_URL, RVM_FILE)
+}
+
+/// Bytes of the face-detection model, found the same way as RVM's.
+pub fn face_model_bytes() -> Result<Vec<u8>> {
+    if let Some(bytes) = EMBEDDED_FACE {
+        return Ok(bytes.to_vec());
+    }
+    if let Some(p) = find_model(FACE_FILE) {
+        return Ok(std::fs::read(p)?);
+    }
+    download("face detection", FACE_URL, FACE_FILE)
+}
+
+fn download(what: &str, url: &str, file: &str) -> Result<Vec<u8>> {
+    let path = paths::writable_model_dir().join(file);
+    crate::log!("Downloading {what} model -> {} ...", path.display());
+    let bytes = ureq::get(url)
         .call()
         .and_then(|r| r.into_body().with_config().limit(200 << 20).read_to_vec())
-        .with_context(|| format!("Failed to download model from {RVM_URL}"))?;
+        .with_context(|| format!("Failed to download model from {url}"))?;
     write_atomic(&path, &bytes).context("Failed to save the downloaded model")?;
     crate::log!("Model ready.");
     Ok(bytes)

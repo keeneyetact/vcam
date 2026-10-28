@@ -41,6 +41,14 @@ curl -L -o models/rvm_mobilenetv3_fp32.onnx \
   https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx
 ```
 
+The YuNet face detector single-person mode uses (OpenCV Zoo, MIT, ~230 KB) is
+bundled the same way from `models/face_detection_yunet_2023mar.onnx`, or
+downloaded the first time single-person mode runs:
+
+```bash
+curl -L -o models/face_detection_yunet_2023mar.onnx   https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+```
+
 `vcam.exe` runs on any **Windows 10/11 (64-bit)** PC — copy it and double-click.
 
 ### Virtual-camera backend (required to feed other apps)
@@ -160,8 +168,9 @@ webcam ─► Media Foundation ─► RVM (3-stage ONNX Runtime pipeline) ─►
 | Module | Does |
 |--------|------|
 | `capture` | Media Foundation source reader; picks the camera's best native format (size first, then fps, so 720p MJPEG@30 wins over YUY2@10) and decodes to RGB |
-| `models` / `onnx_graph` | Finds or downloads RVM, and splits it into encoder / recurrent core / tail stage models by editing the ONNX protobuf directly |
+| `models` / `onnx_graph` | Finds or downloads RVM and the face detector, and splits RVM it into encoder / recurrent core / tail stage models by editing the ONNX protobuf directly |
 | `rvm` | The 3-stage inference pipeline (one session + thread per stage) and the single-session fallback |
+| `faces` | YuNet face detection on its own thread (~10 Hz), telling touching people apart for single-person mode |
 | `kernels` | Fused per-frame passes: input conversion, RVM's full-resolution guided-filter tail, single-person isolation, feather + blend |
 | `compositor` / `imgproc` | Backgrounds (image cover-fit, blur, colour) and the resize/blur primitives |
 | `look` | The realistic picture look: room light/colour matching, lens softness, webcam grain, light wrap |
@@ -250,7 +259,10 @@ Intel iGPUs.
 - **Too slow** → lower the edge detail (`--downsample 0.3`), or use the Smooth
   preset / a lower capture resolution.
 - **A second person/object shows up** → only the person nearest the centre is kept by
-  default; turn off *Only show one person* (`--multi-person` keeps everyone).
+  default, even when people touch: their faces are detected and the shared
+  cutout is split between them. Someone whose face isn't visible can't be told
+  apart from a person they touch. Turn off *Only show one person*
+  (`--multi-person` keeps everyone).
 
 ---
 

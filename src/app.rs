@@ -1765,7 +1765,8 @@ impl App {
         }
         ui.label(
             RichText::new("Drag to move, drag a corner or edge to resize, scroll to zoom. Your background fills \
-                           the rest (black with Original).")
+                           the rest (black with Original). This is the camera's own view: Mirror image flips \
+                           the finished frame.")
                 .size(12.0)
                 .color(p.muted),
         );

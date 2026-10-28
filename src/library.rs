@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use image::imageops::FilterType;
 
-use vcam::imgproc::{self, Frame};
+use vcam::imgproc::{self, Frame, Framing};
 use vcam::paths;
 
 pub const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "bmp", "webp"];
@@ -102,8 +102,8 @@ pub struct ThumbCache {
 }
 
 impl ThumbCache {
-    /// Cover-cropped (w, h) RGB thumbnail of `path`.
-    pub fn fitted(&mut self, path: &Path, w: usize, h: usize) -> Option<Vec<u8>> {
+    /// (w, h) RGB thumbnail of `path`, cropped and fitted as `framing` says.
+    pub fn fitted(&mut self, path: &Path, framing: &Framing, w: usize, h: usize) -> Option<Vec<u8>> {
         let key = (path.to_path_buf(), mtime(path));
         let base = match self.bases.iter().position(|(k, _)| *k == key) {
             Some(i) => &self.bases[i].1,
@@ -115,6 +115,6 @@ impl ThumbCache {
                 &self.bases.last().unwrap().1
             }
         };
-        Some(imgproc::resize_cover(base, w, h).to_rgb())
+        Some(imgproc::frame_background(base, framing, w, h).to_rgb())
     }
 }

@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::capture::{CameraInfo, ExposureMode, FrameGrabber};
 use crate::compositor::Compositor;
-use crate::imgproc::{self, Frame};
+use crate::imgproc::{self, Frame, Framing};
 use crate::kernels;
 use crate::pipeline::OutputPipeline;
 use crate::rvm::RvmEngine;
@@ -48,6 +48,8 @@ pub struct Config {
     pub fps: u32,
     pub mode: BgMode,
     pub bg_path: Option<PathBuf>,
+    /// Which part of the picture is used, and how it's fitted.
+    pub framing: Framing,
     /// Solid colour background, BGR.
     pub color: [u8; 3],
     /// Soften the picture background (out-of-focus look).
@@ -83,6 +85,7 @@ impl Default for Config {
             fps: 30,
             mode: BgMode::Image,
             bg_path: None,
+            framing: Framing::default(),
             color: [64, 177, 0],
             blur_image: false,
             blur_strength: 1.0,
@@ -123,15 +126,27 @@ pub struct Preview {
     pub rgb: Vec<u8>,
 }
 
-type BgKey = (PathBuf, Option<SystemTime>, usize, usize);
+type SourceKey = (PathBuf, Option<SystemTime>);
+type BgKey = (SourceKey, usize, usize, Framing);
+
+/// Decoded pictures are kept at most this big, and this many of them: a
+/// re-crop is then just crop + resize (a few ms), never a decode.
+const SOURCE_MAX_SIDE: usize = 2560;
+const SOURCES_KEPT: usize = 3;
 
 #[derive(Default)]
 struct BgState {
     dirty: bool,
     /// Bumps per background change; stale async loads are dropped.
     gen: u64,
+    /// A loader thread is building a compositor. One at a time: changes made
+    /// meanwhile (e.g. dragging the crop) stay `dirty` and coalesce into the
+    /// next build.
+    loading: bool,
     /// Compositor finished by a loader thread.
     pending: Option<Arc<Compositor>>,
+    /// Decoded pictures, most recent last.
+    sources: Vec<(SourceKey, Arc<Frame>)>,
     /// Fitted backgrounds, most recent last (re-selecting one is instant).
     cache: Vec<(BgKey, Arc<Frame>)>,
 }
@@ -204,16 +219,23 @@ impl VCamWorker {
         }
     }
 
-    pub fn set_background(&self, mode: BgMode, path: Option<PathBuf>, blur_image: Option<bool>) {
+    pub fn set_background(&self, mode: BgMode, path: Option<PathBuf>, framing: Framing, blur_image: Option<bool>) {
         self.configure(|c| {
             c.mode = mode;
             if path.is_some() {
                 c.bg_path = path;
             }
+            c.framing = framing;
             if let Some(b) = blur_image {
                 c.blur_image = b;
             }
         });
+        self.shared.bg.lock().unwrap().dirty = true;
+    }
+
+    /// Crop / fit of the picture, live (coalesced while it's being dragged).
+    pub fn set_framing(&self, framing: Framing) {
+        self.configure(|c| c.framing = framing);
         self.shared.bg.lock().unwrap().dirty = true;
     }
 
@@ -341,25 +363,46 @@ fn thread_main(sh: &Arc<Shared>) {
     *sh.latest.lock().unwrap() = (None, None);
 }
 
-fn fitted_background(sh: &Shared, path: &Path, w: usize, h: usize) -> Result<Arc<Frame>> {
+fn fitted_background(sh: &Shared, path: &Path, framing: &Framing, w: usize, h: usize) -> Result<Arc<Frame>> {
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let key: BgKey = (path.to_path_buf(), mtime, w, h);
-    {
+    let src_key: SourceKey = (path.to_path_buf(), mtime);
+    let key: BgKey = (src_key.clone(), w, h, *framing);
+    let source = {
         let mut bg = sh.bg.lock().unwrap();
-        if let Some(i) = bg.cache.iter().position(|(k, _)| *k == key) {
-            let entry = bg.cache.remove(i);
-            let img = entry.1.clone();
-            bg.cache.push(entry);
+        if let Some(img) = most_recent(&mut bg.cache, &key) {
             return Ok(img);
         }
-    }
-    let img = Arc::new(imgproc::load_background_image(path, w, h)?); // no lock: decoding can be slow
-    let mut bg = sh.bg.lock().unwrap();
-    bg.cache.push((key, img.clone()));
-    while bg.cache.len() > 8 {
-        bg.cache.remove(0); // ~2.7 MB each at 720p
-    }
+        most_recent(&mut bg.sources, &src_key)
+    };
+    let source = match source {
+        Some(s) => s,
+        None => {
+            // No lock: decoding can be slow.
+            let s = Arc::new(imgproc::load_background_source(path, SOURCE_MAX_SIDE)?);
+            keep(&mut sh.bg.lock().unwrap().sources, src_key, s.clone(), SOURCES_KEPT);
+            s
+        }
+    };
+    let img = Arc::new(imgproc::frame_background(&source, framing, w, h));
+    keep(&mut sh.bg.lock().unwrap().cache, key, img.clone(), 8); // ~2.7 MB each at 720p
     Ok(img)
+}
+
+/// The entry for `key`, moved to the most-recent end.
+fn most_recent<K: PartialEq, V: Clone>(list: &mut Vec<(K, V)>, key: &K) -> Option<V> {
+    let i = list.iter().position(|(k, _)| k == key)?;
+    let entry = list.remove(i);
+    let v = entry.1.clone();
+    list.push(entry);
+    Some(v)
+}
+
+fn keep<K: PartialEq, V>(list: &mut Vec<(K, V)>, key: K, v: V, cap: usize) {
+    list.retain(|(k, _)| *k != key);
+    list.push((key, v));
+    while list.len() > cap {
+        list.remove(0);
+    }
 }
 
 /// Build from a config snapshot (no lock held: image decoding can be slow).
@@ -369,7 +412,7 @@ fn build_compositor(sh: &Shared, cfg: &Config, w: usize, h: usize) -> Compositor
         BgMode::Color => return Compositor::color(w, h, cfg.color),
         BgMode::Image => {
             if let Some(p) = cfg.bg_path.as_deref().filter(|p| p.is_file()) {
-                match fitted_background(sh, p, w, h) {
+                match fitted_background(sh, p, &cfg.framing, w, h) {
                     Ok(bg) => {
                         let bg = if cfg.blur_image {
                             Arc::new(imgproc::blur_background_image(&bg, cfg.blur_strength))
@@ -396,10 +439,13 @@ fn build_compositor(sh: &Shared, cfg: &Config, w: usize, h: usize) -> Compositor
 fn load_compositor_async(sh: &Arc<Shared>, gen: u64, cfg: Config, w: usize, h: usize) {
     let sh = sh.clone();
     std::thread::spawn(move || {
-        let comp = Arc::new(build_compositor(&sh, &cfg, w, h));
+        let comp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_compositor(&sh, &cfg, w, h)));
         let mut bg = sh.bg.lock().unwrap();
-        if gen == bg.gen {
-            bg.pending = Some(comp);
+        bg.loading = false; // even if it failed, or the next build would never start
+        if let Ok(comp) = comp {
+            if gen == bg.gen {
+                bg.pending = Some(Arc::new(comp));
+            }
         }
     });
 }
@@ -506,8 +552,9 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             let mut bg = sh.bg.lock().unwrap();
             let cfg = sh.cfg.lock().unwrap();
             let mut load = None;
-            if bg.dirty {
+            if bg.dirty && !bg.loading {
                 bg.dirty = false;
+                bg.loading = true;
                 bg.gen += 1;
                 load = Some((bg.gen, cfg.clone()));
             }

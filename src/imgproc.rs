@@ -313,6 +313,111 @@ pub fn resize_cover(img: &Frame, w: usize, h: usize) -> Frame {
     out
 }
 
+/// A (x, y, w, h) region of `img`; borrowed when it's the whole image.
+pub fn crop(img: &Frame, x: usize, y: usize, w: usize, h: usize) -> std::borrow::Cow<'_, Frame> {
+    if (x, y, w, h) == (0, 0, img.w, img.h) {
+        return std::borrow::Cow::Borrowed(img);
+    }
+    let mut out = Frame::scratch(w, h);
+    out.data.par_chunks_mut(w * 3).enumerate().for_each(|(r, o)| {
+        o.copy_from_slice(&img.data[((y + r) * img.w + x) * 3..][..w * 3]);
+    });
+    std::borrow::Cow::Owned(out)
+}
+
+// --------------------------------------------------------------------------- //
+// Background framing
+// --------------------------------------------------------------------------- //
+
+/// How the cropped picture is laid into the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FitMode {
+    /// Fill the frame: the crop keeps the frame's shape (any overflow is
+    /// trimmed around its centre), so nothing is distorted.
+    #[default]
+    Fill,
+    /// The whole crop, centred over a blurred copy of itself.
+    Fit,
+    /// The crop squeezed or stretched to the frame.
+    Stretch,
+}
+
+/// Which part of a background picture is used, and how it's fitted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Framing {
+    pub fit: FitMode,
+    /// The crop as fractions of the picture: x0, y0, x1, y1.
+    pub crop: [f32; 4],
+}
+
+impl Default for Framing {
+    fn default() -> Self {
+        Self { fit: FitMode::Fill, crop: Self::WHOLE }
+    }
+}
+
+impl Framing {
+    pub const WHOLE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    /// Smallest crop side, as a fraction of the picture's.
+    pub const MIN_SIDE: f32 = 0.05;
+
+    /// The crop clamped into the picture, at least `MIN_SIDE` a side.
+    pub fn clamped(crop: [f32; 4]) -> [f32; 4] {
+        let axis = |a: f32, b: f32| {
+            let len = (b - a).abs().clamp(Self::MIN_SIDE, 1.0);
+            let a = a.min(b).clamp(0.0, 1.0 - len);
+            (a, a + len)
+        };
+        let ((x0, x1), (y0, y1)) = (axis(crop[0], crop[2]), axis(crop[1], crop[3]));
+        [x0, y0, x1, y1]
+    }
+
+    /// The crop actually used for an (iw, ih) picture in a frame of
+    /// `aspect` (w / h): for Fill, trimmed to the frame's shape.
+    pub fn effective_crop(&self, iw: usize, ih: usize, aspect: f32) -> [f32; 4] {
+        let [mut x0, mut y0, mut x1, mut y1] = Self::clamped(self.crop);
+        if self.fit == FitMode::Fill {
+            let (cw, ch) = ((x1 - x0) * iw as f32, (y1 - y0) * ih as f32);
+            if cw > ch * aspect {
+                let (mid, half) = ((x0 + x1) / 2.0, ch * aspect / iw as f32 / 2.0);
+                (x0, x1) = (mid - half, mid + half);
+            } else {
+                let (mid, half) = ((y0 + y1) / 2.0, cw / aspect / ih as f32 / 2.0);
+                (y0, y1) = (mid - half, mid + half);
+            }
+        }
+        [x0, y0, x1, y1]
+    }
+}
+
+/// Crop `img` as `framing` says and lay it into a (w, h) frame.
+pub fn frame_background(img: &Frame, framing: &Framing, w: usize, h: usize) -> Frame {
+    let [x0, y0, x1, y1] = framing.effective_crop(img.w, img.h, w as f32 / h as f32);
+    let px = |v: f32, n: usize| ((v * n as f32).round().max(0.0) as usize).min(n);
+    let (cx, cy) = (px(x0, img.w).min(img.w - 1), px(y0, img.h).min(img.h - 1));
+    let (cw, ch) = ((px(x1, img.w).max(cx + 1)) - cx, (px(y1, img.h).max(cy + 1)) - cy);
+    let region = crop(img, cx, cy, cw, ch);
+    if framing.fit != FitMode::Fit {
+        return resize(&region, w, h);
+    }
+    let k = (w as f64 / cw as f64).min(h as f64 / ch as f64);
+    let fw = ((cw as f64 * k).round() as usize).clamp(1, w);
+    let fh = ((ch as f64 * k).round() as usize).clamp(1, h);
+    let fg = resize(&region, fw, fh);
+    if (fw, fh) == (w, h) {
+        return fg;
+    }
+    // The empty sides: the same crop, filled and heavily blurred (blurred
+    // small, so it costs next to nothing).
+    let small = resize_cover(&region, (w / 8).max(1), (h / 8).max(1));
+    let mut out = resize_linear(&gaussian_blur(&small, 3.0), w, h);
+    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    out.data[oy * w * 3..(oy + fh) * w * 3].par_chunks_mut(w * 3).enumerate().for_each(|(r, o)| {
+        o[ox * 3..(ox + fw) * 3].copy_from_slice(&fg.data[r * fw * 3..][..fw * 3]);
+    });
+    out
+}
+
 // --------------------------------------------------------------------------- //
 // Gaussian blur
 // --------------------------------------------------------------------------- //
@@ -431,10 +536,16 @@ pub fn rgb_to_frame(img: &image::RgbImage) -> Frame {
     Frame { w, h, data }
 }
 
-/// A background picture, cover-fitted to (w, h).
-pub fn load_background_image(path: &Path, w: usize, h: usize) -> Result<Frame> {
+/// A background picture, decoded once and kept for re-framing: at most
+/// `max_side` px a side, plenty for a zoomed-in crop of a 720p frame.
+pub fn load_background_source(path: &Path, max_side: usize) -> Result<Frame> {
     let img = load_rgb(path).with_context(|| format!("Could not read background image: {}", path.display()))?;
-    Ok(resize_cover(&rgb_to_frame(&img), w, h))
+    let img = rgb_to_frame(&img);
+    let k = max_side as f64 / img.w.max(img.h) as f64;
+    if k >= 1.0 {
+        return Ok(img);
+    }
+    Ok(resize(&img, ((img.w as f64 * k).round() as usize).max(1), ((img.h as f64 * k).round() as usize).max(1)))
 }
 
 #[cfg(test)]
@@ -465,6 +576,31 @@ mod tests {
         let c = resize_cover(&f, 128, 72);
         assert_eq!((c.w, c.h), (128, 72));
         assert!(c.data.chunks(3).all(|p| p == [1, 2, 3]));
+    }
+
+    #[test]
+    fn framing_fill_keeps_frame_shape() {
+        let f = Framing { fit: FitMode::Fill, crop: Framing::WHOLE };
+        let [x0, y0, x1, y1] = f.effective_crop(1000, 1000, 16.0 / 9.0);
+        assert!((x0, x1) == (0.0, 1.0) && ((y1 - y0) - 0.5625).abs() < 1e-4 && ((y0 + y1) / 2.0 - 0.5).abs() < 1e-4);
+        assert_eq!(Framing::clamped([0.9, 0.2, 1.3, 0.21])[2], 1.0);
+        let c = Framing::clamped([0.5, 0.5, 0.5, 0.5]);
+        assert!(c[2] - c[0] >= Framing::MIN_SIDE - 1e-6 && c[3] - c[1] >= Framing::MIN_SIDE - 1e-6);
+    }
+
+    #[test]
+    fn framing_sizes_and_letterbox() {
+        let mut img = Frame::filled(400, 100, [200, 200, 200]);
+        for fit in [FitMode::Fill, FitMode::Fit, FitMode::Stretch] {
+            let out = frame_background(&img, &Framing { fit, crop: [0.1, 0.0, 0.6, 1.0] }, 64, 36);
+            assert_eq!((out.w, out.h), (64, 36));
+        }
+        // Fit: a square crop in a 16:9 frame keeps its middle untouched.
+        img = Frame::filled(100, 100, [10, 20, 30]);
+        let out = frame_background(&img, &Framing { fit: FitMode::Fit, crop: Framing::WHOLE }, 64, 36);
+        assert_eq!(&out.data[(18 * 64 + 32) * 3..][..3], &[10, 20, 30]);
+        let c = crop(&img, 10, 20, 30, 40);
+        assert_eq!((c.w, c.h), (30, 40));
     }
 
     #[test]

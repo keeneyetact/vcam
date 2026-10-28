@@ -4,11 +4,15 @@
 //! Python version wrote) never stops the app: anything missing or of the wrong
 //! type falls back to its default.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
 
+use vcam::imgproc::{FitMode, Framing};
 use vcam::paths;
+
+const FITS: [(FitMode, &str); 3] = [(FitMode::Fill, "fill"), (FitMode::Fit, "fit"), (FitMode::Stretch, "stretch")];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -17,6 +21,8 @@ pub struct Settings {
     pub mirror: bool,
     pub mode: String,
     pub bg_path: Option<PathBuf>,
+    /// Each picture's crop and fit, by path.
+    pub framings: HashMap<PathBuf, Framing>,
     pub blur_image: bool,
     pub blur_strength: Option<f64>,
     pub realistic: bool,
@@ -45,6 +51,11 @@ impl Settings {
             mirror: b("mirror", false),
             mode: s("mode"),
             bg_path: m.get("bg_path").and_then(Value::as_str).map(PathBuf::from),
+            framings: m
+                .get("framings")
+                .and_then(Value::as_object)
+                .map(|o| o.iter().filter_map(|(k, v)| Some((PathBuf::from(k), framing_from(v)?))).collect())
+                .unwrap_or_default(),
             blur_image: b("blur_image", false),
             blur_strength: m.get("blur_strength").and_then(Value::as_f64),
             realistic: b("realistic", false),
@@ -68,6 +79,11 @@ impl Settings {
             "mirror": self.mirror,
             "mode": self.mode,
             "bg_path": self.bg_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "framings": self
+                .framings
+                .iter()
+                .map(|(p, f)| (p.to_string_lossy().into_owned(), framing_to(f)))
+                .collect::<Map<String, Value>>(),
             "blur_image": self.blur_image,
             "blur_strength": self.blur_strength.map(|v| (v * 1000.0).round() / 1000.0),
             "realistic": self.realistic,
@@ -88,4 +104,19 @@ impl Settings {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+fn framing_from(v: &Value) -> Option<Framing> {
+    let fit = v.get("fit").and_then(Value::as_str).and_then(|n| FITS.iter().find(|f| f.1 == n))?.0;
+    let c = v.get("crop").and_then(Value::as_array).filter(|a| a.len() == 4)?;
+    let mut crop = [0f32; 4];
+    for (o, v) in crop.iter_mut().zip(c) {
+        *o = v.as_f64()? as f32;
+    }
+    Some(Framing { fit, crop: Framing::clamped(crop) })
+}
+
+fn framing_to(f: &Framing) -> Value {
+    let fit = FITS.iter().find(|x| x.0 == f.fit).map_or("fill", |x| x.1);
+    json!({ "fit": fit, "crop": f.crop.map(|v| (v as f64 * 10000.0).round() / 10000.0) })
 }

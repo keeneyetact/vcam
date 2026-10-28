@@ -7,17 +7,19 @@
 //!   * Advanced settings (performance, edge detail, driver) tucked away.
 //!   * Follows the Windows light/dark theme, is DPI-aware, and remembers settings.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Key, Layout, Margin, Modifiers, Rect, Response,
-    RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Theme, Vec2,
+    self, pos2, vec2, Align, Align2, Color32, CursorIcon, FontFamily, FontId, Key, Layout, Margin, Modifiers, Pos2,
+    Rect, Response, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Theme, Vec2,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use vcam::capture::ExposureMode;
+use vcam::imgproc::{FitMode, Framing};
 use vcam::worker::{BgMode, Preview, Status, VCamWorker};
 use vcam::{capture, imgproc, paths, system, virtualcam, Frame};
 
@@ -70,6 +72,15 @@ const MODES: [(BgMode, &str, &str); 4] = [
     (BgMode::Image, "image", "Image"),
     (BgMode::Color, "color", "Green"),
 ];
+
+const FITS: [(FitMode, &str, &str); 3] = [
+    (FitMode::Fill, "Fill", "Fill the frame; the crop keeps the frame's shape, nothing is squeezed."),
+    (FitMode::Fit, "Fit", "Show the whole crop, with soft blurred edges filling the sides."),
+    (FitMode::Stretch, "Stretch", "Stretch the crop to fill the frame exactly."),
+];
+
+/// The crop editor shows the picture at most this many px a side.
+const EDITOR_PX: u32 = 1024;
 
 /// Thumbnail pixel sizes (drawn at 2x for high-DPI screens).
 const TILE_PX: (usize, usize) = (240, 132);
@@ -259,6 +270,148 @@ fn texture(ctx: &egui::Context, name: &str, img: egui::ColorImage) -> TextureHan
 
 // ------------------------------------------------------------------- app --
 
+/// A part of the crop rectangle to drag: -1 the left / top edge, 1 the right /
+/// bottom one, 0 neither; (0, 0) moves the whole crop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grip {
+    x: i8,
+    y: i8,
+}
+
+impl Grip {
+    const MOVE: Grip = Grip { x: 0, y: 0 };
+
+    fn cursor(self, dragging: bool) -> CursorIcon {
+        match (self.x, self.y) {
+            (0, 0) if dragging => CursorIcon::Grabbing,
+            (0, 0) => CursorIcon::Grab,
+            (0, _) => CursorIcon::ResizeVertical,
+            (_, 0) => CursorIcon::ResizeHorizontal,
+            (x, y) if x == y => CursorIcon::ResizeNwSe,
+            _ => CursorIcon::ResizeNeSw,
+        }
+    }
+}
+
+/// The grip of crop rectangle `r` under `pos` (screen), or None outside it.
+/// With the shape locked only the corners resize.
+fn grip_at(r: Rect, pos: Pos2, locked: bool) -> Option<Grip> {
+    const TOL: f32 = 9.0;
+    if !r.expand(TOL).contains(pos) {
+        return None;
+    }
+    let side = |p: f32, lo: f32, hi: f32| {
+        let tol = TOL.min((hi - lo) / 3.0);
+        if (p - lo).abs() <= tol { -1 } else if (p - hi).abs() <= tol { 1 } else { 0 }
+    };
+    let g = Grip { x: side(pos.x, r.left(), r.right()), y: side(pos.y, r.top(), r.bottom()) };
+    Some(if locked && (g.x == 0 || g.y == 0) { Grip::MOVE } else { g })
+}
+
+/// Smallest crop sides for a crop of shape `lock` (w / h, in fractions of
+/// the picture), or for a free one.
+fn min_sides(lock: Option<f32>) -> (f32, f32) {
+    let m = Framing::MIN_SIDE;
+    match lock {
+        Some(a) => (m.max(m * a), m.max(m * a) / a),
+        None => (m, m),
+    }
+}
+
+/// `c` dragged by `d` (fractions of the picture) at `grip`, kept inside the
+/// picture; `lock` keeps its shape (w / h, in fractions).
+fn dragged_crop(c: [f32; 4], grip: Grip, d: Vec2, lock: Option<f32>) -> [f32; 4] {
+    let [x0, y0, x1, y1] = c;
+    if grip == Grip::MOVE {
+        let dx = d.x.clamp(-x0, 1.0 - x1);
+        let dy = d.y.clamp(-y0, 1.0 - y1);
+        return [x0 + dx, y0 + dy, x1 + dx, y1 + dy];
+    }
+    let (mw, mh) = min_sides(lock);
+    let Some(a) = lock else {
+        let mut c = c;
+        match grip.x {
+            -1 => c[0] = (x0 + d.x).clamp(0.0, x1 - mw),
+            1 => c[2] = (x1 + d.x).clamp(x0 + mw, 1.0),
+            _ => {}
+        }
+        match grip.y {
+            -1 => c[1] = (y0 + d.y).clamp(0.0, y1 - mh),
+            1 => c[3] = (y1 + d.y).clamp(y0 + mh, 1.0),
+            _ => {}
+        }
+        return c;
+    };
+    // Locked: resize about the opposite corner, following whichever of the
+    // pointer's x / y asks for the bigger crop.
+    let (gx, gy) = (grip.x as f32, grip.y as f32);
+    let (ax, ay) = (if gx > 0.0 { x0 } else { x1 }, if gy > 0.0 { y0 } else { y1 });
+    let (cx, cy) = (if gx > 0.0 { x1 } else { x0 } + d.x, if gy > 0.0 { y1 } else { y0 } + d.y);
+    let want = ((cx - ax) * gx).max((cy - ay) * gy * a);
+    let room = (if gx > 0.0 { 1.0 - ax } else { ax }).min((if gy > 0.0 { 1.0 - ay } else { ay }) * a);
+    let w = want.max(mw).min(room);
+    let (nx, ny) = (ax + w * gx, ay + w / a * gy);
+    [ax.min(nx), ay.min(ny), ax.max(nx), ay.max(ny)]
+}
+
+/// `c` scaled by `k` about its centre (shape kept), kept inside the picture.
+fn zoomed_crop(c: [f32; 4], k: f32, lock: Option<f32>) -> [f32; 4] {
+    let (mut w, mut h) = ((c[2] - c[0]) * k, (c[3] - c[1]) * k);
+    let over = w.max(h).max(1.0); // never bigger than the picture
+    (w, h) = (w / over, h / over);
+    let (mw, mh) = min_sides(lock);
+    let under = (mw / w).max(mh / h).max(1.0);
+    (w, h) = (w * under, h * under);
+    let (mx, my) = ((c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0);
+    let (x0, y0) = ((mx - w / 2.0).clamp(0.0, 1.0 - w), (my - h / 2.0).clamp(0.0, 1.0 - h));
+    [x0, y0, x0 + w, y0 + h]
+}
+
+/// `c` slid against an edge of the picture (-1 / 1 per axis) or centred (0);
+/// None leaves that axis alone.
+fn aligned_crop(c: [f32; 4], x: Option<i8>, y: Option<i8>) -> [f32; 4] {
+    let place = |lo: f32, hi: f32, to: Option<i8>| {
+        let len = hi - lo;
+        let lo = match to {
+            Some(-1) => 0.0,
+            Some(1) => 1.0 - len,
+            Some(_) => (1.0 - len) / 2.0,
+            None => lo,
+        };
+        (lo, lo + len)
+    };
+    let ((x0, x1), (y0, y1)) = (place(c[0], c[2], x), place(c[1], c[3], y));
+    [x0, y0, x1, y1]
+}
+
+/// The crop editor window.
+struct CropEditor {
+    path: PathBuf,
+    /// The picture, downscaled, once it's loaded off the UI thread.
+    tex: Option<TextureHandle>,
+    job: Option<mpsc::Receiver<Option<egui::ColorImage>>>,
+    /// What's being dragged, the crop when the drag began, and where.
+    drag: Option<(Grip, [f32; 4], Pos2)>,
+}
+
+impl CropEditor {
+    fn open(ctx: &egui::Context, path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let (src, ctx) = (path.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let img = imgproc::load_rgb(&src).ok().map(|img| {
+                let k = (EDITOR_PX as f64 / img.width().max(img.height()) as f64).min(1.0);
+                let (w, h) = (((img.width() as f64 * k) as u32).max(1), ((img.height() as f64 * k) as u32).max(1));
+                let img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+                egui::ColorImage::from_rgb([w as usize, h as usize], img.as_raw())
+            });
+            let _ = tx.send(img);
+            ctx.request_repaint();
+        });
+        Self { path, tex: None, job: Some(rx), drag: None }
+    }
+}
+
 struct GalleryItem {
     path: PathBuf,
     removable: bool,
@@ -273,6 +426,10 @@ pub struct App {
     mirror: bool,
     mode: BgMode,
     bg_path: Option<PathBuf>,
+    framings: HashMap<PathBuf, Framing>,
+    crop_edit: Option<CropEditor>,
+    /// The picture tile waits for a crop drag / zoom to finish.
+    tile_stale: bool,
     blur_image: bool,
     blur: f32,
     realistic: bool,
@@ -364,6 +521,9 @@ impl App {
             mirror: s.mirror,
             mode,
             bg_path,
+            framings: s.framings.clone(),
+            crop_edit: None,
+            tile_stale: false,
             blur_image: s.blur_image,
             blur: s.blur_strength.map_or(BLUR_DEFAULT, |v| (v as f32).clamp(BLUR_MIN, BLUR_MAX)),
             realistic: s.realistic,
@@ -416,6 +576,7 @@ impl App {
             mirror: self.mirror,
             mode: MODES.iter().find(|m| m.0 == self.mode).map_or("blur", |m| m.1).into(),
             bg_path: self.bg_path.clone(),
+            framings: self.framings.clone(),
             blur_image: self.blur_image,
             blur_strength: Some(self.blur as f64),
             realistic: self.realistic,
@@ -447,7 +608,7 @@ impl App {
         let pic = self
             .bg_path
             .clone()
-            .and_then(|p| self.thumbs.fitted(&p, tw, th))
+            .and_then(|p| self.thumbs.fitted(&p, &self.framing(), tw, th))
             .map(|rgb| Canvas { w: tw, h: th, rgb }.person())
             .unwrap_or_else(|| {
                 let mut c = Canvas::new(tw, th, if self.dark { [60, 66, 76] } else { [210, 214, 220] });
@@ -469,7 +630,7 @@ impl App {
         self.gallery = library::library()
             .into_iter()
             .filter_map(|(path, removable)| {
-                let rgb = self.thumbs.fitted(&path, cw, ch)?;
+                let rgb = self.thumbs.fitted(&path, &Framing::default(), cw, ch)?;
                 let tex = texture(ctx, &path.to_string_lossy(), egui::ColorImage::from_rgb([cw, ch], &rgb));
                 Some(GalleryItem { path, removable, tex })
             })
@@ -483,7 +644,7 @@ impl App {
         // just move the highlight -- no gallery rebuild, no re-decoding.
         self.bg_path = Some(path.clone());
         self.mode = BgMode::Image;
-        self.worker.set_background(BgMode::Image, Some(path), Some(self.blur_image));
+        self.worker.set_background(BgMode::Image, Some(path), self.framing(), Some(self.blur_image));
         self.render_thumbs(ctx);
         self.schedule_save();
     }
@@ -531,11 +692,42 @@ impl App {
             if self.bg_path.is_none() && self.mode == BgMode::Image {
                 self.mode = BgMode::Blur;
             }
-            self.worker.set_background(self.mode, self.bg_path.clone(), Some(self.blur_image));
+            self.worker.set_background(self.mode, self.bg_path.clone(), self.framing(), Some(self.blur_image));
         }
+        self.framings.remove(path);
         self.render_gallery(ctx);
         self.render_thumbs(ctx);
         self.schedule_save();
+    }
+
+    /// The chosen picture's crop and fit.
+    fn framing(&self) -> Framing {
+        self.bg_path.as_ref().and_then(|p| self.framings.get(p)).copied().unwrap_or_default()
+    }
+
+    /// Change the chosen picture's crop / fit; it applies live. `dragging`:
+    /// more changes follow at once, so the thumbnail waits for the last.
+    fn set_framing(&mut self, ctx: &egui::Context, f: Framing, dragging: bool) {
+        let Some(path) = self.bg_path.clone() else { return };
+        let f = Framing { crop: Framing::clamped(f.crop), ..f };
+        if f == Framing::default() {
+            self.framings.remove(&path);
+        } else {
+            self.framings.insert(path, f);
+        }
+        self.worker.set_framing(f);
+        if dragging {
+            self.tile_stale = true;
+        } else {
+            self.tile_stale = false;
+            self.render_thumbs(ctx);
+        }
+        self.schedule_save();
+    }
+
+    /// The output's shape (w / h): the camera's while running.
+    fn frame_aspect(&self) -> f32 {
+        self.worker.camera_info().map_or(16.0 / 9.0, |c| c.width as f32 / c.height.max(1) as f32)
     }
 
     /// Image mode needs a picture: use the first in the library, else ask.
@@ -596,6 +788,7 @@ impl App {
             c.camera = self.cam;
             c.mode = self.mode;
             c.bg_path = self.bg_path.clone();
+            c.framing = self.framing();
             c.blur_image = self.blur_image;
             c.blur_strength = self.blur;
             c.realistic = self.realistic;
@@ -613,7 +806,7 @@ impl App {
         if self.mode == BgMode::Image && !self.ensure_image(ctx) {
             self.mode = BgMode::Blur;
         }
-        self.worker.set_background(self.mode, self.bg_path.clone(), Some(self.blur_image));
+        self.worker.set_background(self.mode, self.bg_path.clone(), self.framing(), Some(self.blur_image));
         self.schedule_save();
     }
 
@@ -1122,6 +1315,8 @@ impl App {
             {
                 self.apply_bg(&ctx);
             }
+            ui.add_space(6.0);
+            self.ui_framing(ui, &ctx);
         }
         if self.mode == BgMode::Blur || (self.mode == BgMode::Image && self.blur_image) {
             ui.add_space(6.0);
@@ -1160,6 +1355,234 @@ impl App {
         }
         if self.adv_open {
             self.ui_advanced(ui, &ctx);
+        }
+    }
+
+    /// Fill / Fit / Stretch tiles; picks one, or None.
+    fn fit_tiles(ui: &mut egui::Ui, p: &Palette, current: FitMode) -> Option<FitMode> {
+        let full = ui.available_width();
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for &(fit, label, tip) in &FITS {
+                let r = Self::tile(ui, p, (full - 12.0) / 3.0, None, Vec2::ZERO, label, current == fit);
+                if r.on_hover_text(tip).clicked() && current != fit {
+                    picked = Some(fit);
+                }
+            }
+        });
+        picked
+    }
+
+    /// How the picture is fitted, and the way into the crop editor.
+    fn ui_framing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = self.pal();
+        let f = self.framing();
+        let mut open = false;
+        ui.horizontal(|ui| {
+            ui.label("Framing");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let text = if f.crop == Framing::WHOLE { "Crop…" } else { "Edit crop…" };
+                open = Self::link(ui, p, text)
+                    .on_hover_text("Choose the part of the picture to use: move, resize or zoom the crop.")
+                    .clicked();
+            });
+        });
+        if let Some(fit) = Self::fit_tiles(ui, p, f.fit) {
+            self.set_framing(ctx, Framing { fit, ..f }, false);
+        }
+        if open && self.crop_edit.is_none() {
+            if let Some(path) = self.bg_path.clone() {
+                self.crop_edit = Some(CropEditor::open(ctx, path));
+            }
+        }
+    }
+
+    /// The crop editor window: the whole picture with the crop on top. Every
+    /// change shows live in the preview.
+    fn ui_crop_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.crop_edit.take() else { return };
+        // It follows the chosen picture, and closes when there's none.
+        match self.bg_path.clone() {
+            Some(path) if self.mode == BgMode::Image => {
+                if path != ed.path {
+                    ed = CropEditor::open(ctx, path);
+                }
+            }
+            _ => return,
+        }
+        if let Some(rx) = &ed.job {
+            match rx.try_recv() {
+                Ok(Some(img)) => {
+                    ed.tex = Some(texture(ctx, "crop-editor", img));
+                    ed.job = None;
+                }
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => return, // unreadable picture
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let p = self.pal();
+        let aspect = self.frame_aspect();
+        let mut f = self.framing();
+        let mut changed: Option<bool> = None; // Some(still dragging)
+        let mut open = !ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut done = false;
+        egui::Window::new("Crop & position")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                let box_size = vec2(560.0, 380.0);
+                ui.set_width(box_size.x);
+                if let Some(fit) = Self::fit_tiles(ui, p, f.fit) {
+                    f.fit = fit;
+                    changed = Some(false);
+                }
+                ui.add_space(6.0);
+                let Some(tex) = ed.tex.clone() else {
+                    ui.add_sized(vec2(box_size.x, box_size.y * 0.8), egui::Spinner::new());
+                    return;
+                };
+                let [iw, ih] = tex.size();
+                let k = (box_size.x / iw as f32).min(box_size.y / ih as f32);
+                let size = vec2(iw as f32 * k, ih as f32 * k);
+                // Fill keeps the frame's shape (as a w / h of picture fractions).
+                let lock = (f.fit == FitMode::Fill).then(|| aspect * ih as f32 / iw as f32);
+                let crop = f.effective_crop(iw, ih, aspect);
+
+                let (rect, resp) = ui
+                    .vertical_centered(|ui| ui.allocate_exact_size(size, Sense::click_and_drag()))
+                    .inner;
+                let to_screen = |c: [f32; 4]| {
+                    Rect::from_min_max(rect.min + vec2(c[0], c[1]) * size, rect.min + vec2(c[2], c[3]) * size)
+                };
+                let cr = to_screen(crop);
+                // A new crop; `dragging`: more follow at once.
+                let set = |f: &mut Framing, changed: &mut Option<bool>, c: [f32; 4], dragging: bool| {
+                    if c != f.crop || !dragging {
+                        f.crop = c;
+                        *changed = Some(dragging);
+                    }
+                };
+
+                // Drag a grip; pressing outside the crop first brings it there.
+                if resp.drag_started() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        ed.drag = Some(match grip_at(cr, pos, lock.is_some()) {
+                            Some(g) => (g, crop, pos),
+                            None => (Grip::MOVE, dragged_crop(crop, Grip::MOVE, (pos - cr.center()) / size, lock), pos),
+                        });
+                    }
+                }
+                if let (Some((grip, start, from)), Some(pos)) = (ed.drag, resp.interact_pointer_pos()) {
+                    if resp.dragged() {
+                        set(&mut f, &mut changed, dragged_crop(start, grip, (pos - from) / size, lock), true);
+                    }
+                }
+                if resp.drag_stopped() {
+                    ed.drag = None;
+                    let c = f.crop;
+                    set(&mut f, &mut changed, c, false);
+                }
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos().filter(|&pos| grip_at(cr, pos, lock.is_some()).is_none()) {
+                        set(&mut f, &mut changed, dragged_crop(crop, Grip::MOVE, (pos - cr.center()) / size, lock), false);
+                    }
+                }
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        set(&mut f, &mut changed, zoomed_crop(crop, (-scroll * 0.002).exp(), lock), true);
+                    }
+                }
+                let hover = resp.hover_pos().and_then(|pos| grip_at(cr, pos, lock.is_some()));
+                if let Some(g) = ed.drag.map(|d| d.0).or(hover) {
+                    ctx.set_cursor_icon(g.cursor(ed.drag.is_some()));
+                }
+
+                // The picture, dimmed outside the crop, with a rule-of-thirds grid.
+                let cr = to_screen(f.effective_crop(iw, ih, aspect)); // as changed just now
+                egui::Image::from_texture(&tex).paint_at(ui, rect);
+                let painter = ui.painter();
+                let shade = Color32::from_black_alpha(150);
+                for r in [
+                    Rect::from_min_max(rect.min, pos2(rect.right(), cr.top())),
+                    Rect::from_min_max(pos2(rect.left(), cr.bottom()), rect.max),
+                    Rect::from_min_max(pos2(rect.left(), cr.top()), pos2(cr.left(), cr.bottom())),
+                    Rect::from_min_max(pos2(cr.right(), cr.top()), pos2(rect.right(), cr.bottom())),
+                ] {
+                    painter.rect_filled(r, 0.0, shade);
+                }
+                let faint = Stroke::new(1.0, Color32::from_white_alpha(80));
+                for t in [1.0 / 3.0, 2.0 / 3.0] {
+                    let (x, y) = (cr.left() + cr.width() * t, cr.top() + cr.height() * t);
+                    painter.line_segment([pos2(x, cr.top()), pos2(x, cr.bottom())], faint);
+                    painter.line_segment([pos2(cr.left(), y), pos2(cr.right(), y)], faint);
+                }
+                painter.rect_stroke(cr, 0.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+                let mut grips = vec![cr.left_top(), cr.right_top(), cr.left_bottom(), cr.right_bottom()];
+                if lock.is_none() {
+                    grips.extend([cr.center_top(), cr.center_bottom(), cr.left_center(), cr.right_center()]);
+                }
+                for g in grips {
+                    painter.rect(Rect::from_center_size(g, vec2(9.0, 9.0)), 1.5, Color32::WHITE,
+                                 Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Middle);
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if lock.is_some() {
+                        "Drag to move, drag a corner to resize, scroll to zoom. Fill keeps the frame's shape."
+                    } else {
+                        "Drag to move, drag a corner or edge to resize, scroll to zoom."
+                    })
+                    .size(12.0)
+                    .color(p.muted),
+                );
+
+                ui.add_space(6.0);
+                let crop = f.effective_crop(iw, ih, aspect);
+                ui.horizontal(|ui| {
+                    ui.label("Align");
+                    for (label, x, y) in [
+                        ("Left", Some(-1), None),
+                        ("Top", None, Some(-1)),
+                        ("Centre", Some(0), Some(0)),
+                        ("Bottom", None, Some(1)),
+                        ("Right", Some(1), None),
+                    ] {
+                        if ui.button(label).clicked() {
+                            set(&mut f, &mut changed, aligned_crop(crop, x, y), false);
+                        }
+                    }
+                    ui.separator();
+                    ui.label("Zoom");
+                    if ui.button(" − ").on_hover_text("Zoom out").clicked() {
+                        set(&mut f, &mut changed, zoomed_crop(crop, 1.25, lock), false);
+                    }
+                    if ui.button(" + ").on_hover_text("Zoom in").clicked() {
+                        set(&mut f, &mut changed, zoomed_crop(crop, 0.8, lock), false);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Whole picture").on_hover_text("Undo the crop").clicked() {
+                        set(&mut f, &mut changed, Framing::WHOLE, false);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        done = ui.button("  Done  ").clicked();
+                    });
+                });
+            });
+        if let Some(dragging) = changed {
+            self.set_framing(ctx, f, dragging);
+        }
+        if open && !done {
+            self.crop_edit = Some(ed);
+        } else if self.tile_stale {
+            self.tile_stale = false;
+            self.render_thumbs(ctx);
         }
     }
 
@@ -1400,6 +1823,16 @@ impl eframe::App for App {
                 });
             });
 
+        self.ui_crop_editor(&ctx);
+        // The picture tile catches up once a crop drag / zoom settles.
+        if self.tile_stale
+            && self.crop_edit.as_ref().is_none_or(|e| e.drag.is_none())
+            && ctx.input(|i| i.smooth_scroll_delta == Vec2::ZERO)
+        {
+            self.tile_stale = false;
+            self.render_thumbs(&ctx);
+        }
+
         // Pictures dragged over the window: say what dropping them does.
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
@@ -1415,5 +1848,48 @@ impl eframe::App for App {
         // preview frames request their own repaint.
         let fast = self.worker.status() == Status::Starting || self.busy.is_some() || self.save_at.is_some();
         ctx.request_repaint_after(Duration::from_millis(if fast { 100 } else { 250 }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inside(c: [f32; 4]) -> bool {
+        c[0] >= 0.0 && c[1] >= 0.0 && c[2] <= 1.0 + 1e-6 && c[3] <= 1.0 + 1e-6 && c[0] < c[2] && c[1] < c[3]
+    }
+
+    #[test]
+    fn locked_drag_keeps_shape_and_stays_inside() {
+        let a = 1.5;
+        let start = [0.2, 0.2, 0.5, 0.4];
+        for d in [vec2(0.9, 0.1), vec2(-0.9, -0.9), vec2(0.05, 0.6), vec2(-0.3, 0.0)] {
+            for grip in [Grip { x: 1, y: 1 }, Grip { x: -1, y: -1 }, Grip { x: 1, y: -1 }, Grip { x: -1, y: 1 }] {
+                let c = dragged_crop(start, grip, d, Some(a));
+                assert!(inside(c), "{c:?}");
+                assert!(((c[2] - c[0]) / (c[3] - c[1]) - a).abs() < 1e-3, "{c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn moving_and_zooming_stay_inside() {
+        let c = dragged_crop([0.2, 0.2, 0.5, 0.4], Grip::MOVE, vec2(5.0, -5.0), None);
+        assert!(inside(c) && (c[2], c[1]) == (1.0, 0.0));
+        let z = zoomed_crop([0.0, 0.0, 0.5, 0.5], 10.0, None);
+        assert!(inside(z) && z[2] - z[0] <= 1.0);
+        let z = zoomed_crop([0.4, 0.4, 0.6, 0.6], 0.001, Some(1.0));
+        assert!(z[2] - z[0] >= Framing::MIN_SIDE - 1e-6);
+        let a = aligned_crop([0.2, 0.2, 0.5, 0.4], Some(1), Some(-1));
+        assert!(a.iter().zip([0.7, 0.0, 1.0, 0.2]).all(|(a, b)| (a - b).abs() < 1e-6), "{a:?}");
+    }
+
+    #[test]
+    fn grips() {
+        let r = Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 200.0));
+        assert_eq!(grip_at(r, pos2(101.0, 199.0), false), Some(Grip { x: -1, y: 1 }));
+        assert_eq!(grip_at(r, pos2(200.0, 101.0), false), Some(Grip { x: 0, y: -1 }));
+        assert_eq!(grip_at(r, pos2(200.0, 101.0), true), Some(Grip::MOVE));
+        assert_eq!(grip_at(r, pos2(50.0, 50.0), false), None);
     }
 }

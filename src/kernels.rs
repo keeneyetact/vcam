@@ -228,6 +228,14 @@ const STICKINESS: f32 = 0.08;
 const CUT_VERTICAL: f32 = 0.1;
 /// Width of the soft edge along a cut, as a fraction of the kept face width.
 const CUT_SOFTNESS: f32 = 0.25;
+/// Labelling-resolution px over which the matte fades out past the kept
+/// blob's dilated edge: removing the rest along a hard line reads as a
+/// scissor cut.
+const FADE: usize = 6;
+/// How far the keep weight may drop per frame, so whatever is removed
+/// dissolves over a few frames instead of vanishing in one. It may rise at
+/// once, so the kept person is never held back.
+const FADE_OUT_STEP: f32 = 0.25;
 
 /// A straight cut through a blob shared by two people: alpha is kept where
 /// `(x - mx) * nx + (y - my) * ny` is negative, fading out over `soft` px.
@@ -256,16 +264,24 @@ impl Cut {
     }
 }
 
-/// Keep only one person in an HxW matte, in place; suppress the rest while
+/// Keep only one person in an HxW matte, in place; fade out the rest while
 /// preserving the kept subject's soft edges. Components are labelled at half
-/// resolution above 640 px (blobs are large).
+/// resolution above 640 px (blobs are large). `history` carries the keep
+/// weights from frame to frame (empty to start afresh).
 ///
 /// With `faces` (frame pixels), the person is the face on the matte nearest
 /// the frame centre -- favouring `prev`, the one kept last time -- and if
 /// other faces share its blob (people touching), the blob is cut between
 /// them. Without, it's the blob nearest the centre. Returns the face kept, or
 /// `prev` when no face was usable.
-pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Option<[f32; 2]>) -> Option<[f32; 2]> {
+pub fn keep_central(
+    a: &mut [f32],
+    h: usize,
+    w: usize,
+    faces: &[Face],
+    prev: Option<[f32; 2]>,
+    history: &mut Vec<f32>,
+) -> Option<[f32; 2]> {
     assert_eq!(a.len(), h * w, "alpha must be HxW");
     // An exact 2x INTER_LINEAR downscale is the mean of each 2x2 block.
     let half = h.max(w) > 640;
@@ -314,6 +330,7 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Opt
     }
     BYTES.give(bin);
     if runs.is_empty() {
+        history.clear();
         return prev; // nothing detected; leave the matte as-is
     }
 
@@ -396,7 +413,8 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Opt
     };
     let kept = |i: usize| parent[i] as usize == central;
 
-    // The blob's bounding box: nothing outside it (+5 px of dilation) survives.
+    // The blob's bounding box: nothing outside it (+5 px of dilation, + the
+    // fade) is kept this frame.
     let (mut x0, mut x1, mut y0, mut y1) = (sw, 0, sh, 0);
     for y in 0..sh {
         for i in (row_at[y]..row_at[y + 1]).filter(|&i| kept(i)) {
@@ -404,8 +422,9 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Opt
             (x0, x1, y0, y1) = (x0.min(s as usize), x1.max(e as usize - 1), y0.min(y), y1.max(y));
         }
     }
-    let (x0, x1) = (x0.saturating_sub(5), (x1 + 6).min(sw));
-    let (y0, y1) = (y0.saturating_sub(5), (y1 + 6).min(sh));
+    let m = 5 + FADE;
+    let (x0, x1) = (x0.saturating_sub(m), (x1 + 1 + m).min(sw));
+    let (y0, y1) = (y0.saturating_sub(m), (y1 + 1 + m).min(sh));
 
     // Per-row prefix counts of the kept blob, so the 11x11 elliptical dilation
     // is 11 O(1) span tests per pixel instead of ~100 neighbour reads.
@@ -449,24 +468,78 @@ pub fn keep_central(a: &mut [f32], h: usize, w: usize, faces: &[Face], prev: Opt
     });
     U32S.give(pre);
 
-    // Zero the matte outside the dilated blob, mapping each full-res pixel to its
-    // nearest low-res one (INTER_NEAREST upscale), and fade it out across cuts.
-    let xmap: Vec<usize> = (0..w).map(|xx| xx * sw / w).collect();
+    // Keep weights: 1 on the dilated blob, easing to 0 over FADE px past it
+    // (a box blur of the blob, doubled so it's 1 at the blob's edge, then
+    // smoothstepped), times the soft cuts between touching people.
+    let side = 2 * FADE + 1;
+    let mut hsum = U32S.zeroed(sh * sw);
     pool().install(|| {
-        a.par_chunks_mut(w).enumerate().for_each(|(yy, row)| {
-            let krow = &keep[(yy * sh / h) * sw..][..sw];
-            for (xx, (v, &sx)) in row.iter_mut().zip(&xmap).enumerate() {
-                if krow[sx] == 0 {
-                    *v = 0.0;
-                } else if *v > 0.0 {
+        hsum.par_chunks_mut(sw).enumerate().for_each_init(
+            || vec![0u32; sw + 1],
+            |pre, (y, row)| {
+                if y < y0 || y >= y1 {
+                    return;
+                }
+                for (x, &k) in keep[y * sw..][..sw].iter().enumerate() {
+                    pre[x + 1] = pre[x] + k as u32;
+                }
+                for (x, v) in row.iter_mut().enumerate().take(x1).skip(x0) {
+                    *v = pre[(x + FADE + 1).min(sw)] - pre[x.saturating_sub(FADE)];
+                }
+            },
+        );
+    });
+    let (fx, fy) = (w as f32 / sw as f32, h as f32 / sh as f32);
+    let mut weight = FLOATS.zeroed(sh * sw);
+    pool().install(|| {
+        weight.par_chunks_mut(sw).enumerate().for_each(|(y, row)| {
+            if y < y0 || y >= y1 {
+                return;
+            }
+            let krow = &keep[y * sw..][..sw];
+            for (x, v) in row.iter_mut().enumerate().take(x1).skip(x0) {
+                *v = if krow[x] != 0 {
+                    1.0
+                } else {
+                    let n: u32 = (y.saturating_sub(FADE)..(y + FADE + 1).min(sh)).map(|yy| hsum[yy * sw + x]).sum();
+                    let t = (2.0 * n as f32 / (side * side) as f32).min(1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                if *v > 0.0 {
                     for c in &cuts {
-                        *v *= c.weight(xx as f32 + 0.5, yy as f32 + 0.5);
+                        *v *= c.weight((x as f32 + 0.5) * fx, (y as f32 + 0.5) * fy);
                     }
                 }
             }
         });
     });
+    U32S.give(hsum);
     BYTES.give(keep);
+    if history.len() == weight.len() {
+        for (v, &p) in weight.iter_mut().zip(history.iter()) {
+            *v = v.max(p - FADE_OUT_STEP);
+        }
+    }
+
+    // Scale the matte by the weights, upsampled bilinearly to full resolution.
+    let cols: Vec<(usize, usize, f32)> = (0..w).map(|x| resize_coord(x, w, sw)).collect();
+    {
+        let weight: &[f32] = &weight;
+        pool().install(|| {
+            a.par_chunks_mut(w).enumerate().for_each(|(yy, row)| {
+                let (r0, r1, dy) = resize_coord(yy, h, sh);
+                let (r0, r1) = (&weight[r0 * sw..][..sw], &weight[r1 * sw..][..sw]);
+                for (v, &(x0, x1, dx)) in row.iter_mut().zip(&cols) {
+                    if *v > 0.0 {
+                        let top = r0[x0] * (1.0 - dx) + r0[x1] * dx;
+                        let bottom = r1[x0] * (1.0 - dx) + r1[x1] * dx;
+                        *v *= top * (1.0 - dy) + bottom * dy;
+                    }
+                }
+            });
+        });
+    }
+    FLOATS.give(std::mem::replace(history, weight));
     kept_face
 }
 
@@ -703,7 +776,7 @@ mod tests {
                 a[y * w + x] = 1.0; // speck, > 5 px away
             }
         }
-        keep_central(&mut a, h, w, &[], None);
+        keep_central(&mut a, h, w, &[], None, &mut Vec::new());
         assert_eq!(a[20 * w + 20], 1.0);
         assert_eq!(a[12 * w + 52], 0.0);
     }
@@ -722,7 +795,7 @@ mod tests {
                 a[y * w + x] = 1.0; // smaller person in the middle
             }
         }
-        keep_central(&mut a, h, w, &[], None);
+        keep_central(&mut a, h, w, &[], None, &mut Vec::new());
         assert_eq!(a[40 * w + 60], 1.0);
         assert_eq!(a[30 * w + 10], 0.0);
     }
@@ -751,7 +824,7 @@ mod tests {
         let mut a = two_touching(h, w);
         let faces = [face(70.0, 25.0, 30.0), face(140.0, 25.0, 30.0)];
         // Face 70 is nearer the centre (100).
-        let kept = keep_central(&mut a, h, w, &faces, None);
+        let kept = keep_central(&mut a, h, w, &faces, None, &mut Vec::new());
         assert_eq!(kept, Some([70.0, 25.0]));
         assert_eq!(a[25 * w + 70], 1.0, "kept head");
         assert_eq!(a[100 * w + 40], 1.0, "kept body");
@@ -768,14 +841,14 @@ mod tests {
         // The right face is only a little nearer the centre than the left...
         let near = [face(62.0, 25.0, 30.0), face(132.0, 25.0, 30.0)];
         let mut a = two_touching(h, w);
-        assert_eq!(keep_central(&mut a, h, w, &near, None), Some([132.0, 25.0]));
+        assert_eq!(keep_central(&mut a, h, w, &near, None, &mut Vec::new()), Some([132.0, 25.0]));
         // ...so if the left one was kept last time, it stays.
         let mut a = two_touching(h, w);
-        assert_eq!(keep_central(&mut a, h, w, &near, Some([60.0, 25.0])), Some([62.0, 25.0]));
+        assert_eq!(keep_central(&mut a, h, w, &near, Some([60.0, 25.0]), &mut Vec::new()), Some([62.0, 25.0]));
         assert_eq!(a[25 * w + 140], 0.0);
         // A face off the matte (a poster) is ignored.
         let mut a = two_touching(h, w);
-        let kept = keep_central(&mut a, h, w, &[face(100.0, 5.0, 10.0), faces[0]], None);
+        let kept = keep_central(&mut a, h, w, &[face(100.0, 5.0, 10.0), faces[0]], None, &mut Vec::new());
         assert_eq!(kept, Some([70.0, 25.0]));
     }
 
@@ -841,11 +914,82 @@ mod tests {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 *v = if ((seed >> 8) as f32 / (1u32 << 24) as f32) < density { 0.9 } else { 0.1 };
             }
+            let orig = a.clone();
             let mut expect = a.clone();
             keep_central_reference(&mut expect, h, w);
-            keep_central(&mut a, h, w, &[], None);
-            assert_eq!(a, expect, "{h}x{w} @ {density}");
+            keep_central(&mut a, h, w, &[], None, &mut Vec::new());
+            // The reference's kept region is untouched; past it the matte
+            // only fades, and is gone more than FADE px out.
+            for i in 0..h * w {
+                if expect[i] != 0.0 {
+                    assert_eq!(a[i], orig[i], "{h}x{w} @ {density}: kept pixel {i} changed");
+                    continue;
+                }
+                assert!(a[i] <= orig[i], "{h}x{w} @ {density}: pixel {i} grew");
+                let (y, x) = (i / w, i % w);
+                let near = (y.saturating_sub(FADE)..(y + FADE + 1).min(h))
+                    .any(|yy| (x.saturating_sub(FADE)..(x + FADE + 1).min(w)).any(|xx| expect[yy * w + xx] != 0.0));
+                if !near {
+                    assert_eq!(a[i], 0.0, "{h}x{w} @ {density}: pixel {i} far from the kept blob survived");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn keep_central_fades_out_past_the_blob() {
+        let (h, w) = (40, 80);
+        let mut a = vec![0f32; h * w];
+        for y in 0..h {
+            for x in 30..50 {
+                a[y * w + x] = 1.0; // the person, mid-frame
+            }
+            for x in 58..80 {
+                a[y * w + x] = 0.4; // someone else's soft edge, just past the dilation
+            }
+        }
+        keep_central(&mut a, h, w, &[], None, &mut Vec::new());
+        let row = &a[20 * w..][..w];
+        assert_eq!(row[40], 1.0);
+        assert_eq!(row[54], 0.0, "background stays background");
+        // Fades smoothly to nothing rather than stopping at a line.
+        assert!(row[58] > 0.0 && row[58] < 0.4, "{}", row[58]);
+        assert!(row[58..].windows(2).all(|p| p[1] <= p[0]));
+        assert_eq!(row[70], 0.0);
+    }
+
+    #[test]
+    fn keep_central_fades_a_removed_person_over_frames() {
+        let (h, w) = (40, 120);
+        let frame = |bridge: bool| {
+            let mut a = vec![0f32; h * w];
+            for y in 10..40 {
+                for x in (45..75).chain(95..115) {
+                    a[y * w + x] = 1.0;
+                }
+                if bridge && y >= 30 {
+                    a[y * w + 75..y * w + 95].fill(1.0); // touching: one blob
+                }
+            }
+            a
+        };
+        let mut history = Vec::new();
+        let mut a = frame(true);
+        keep_central(&mut a, h, w, &[], None, &mut history);
+        assert_eq!(a[20 * w + 105], 1.0, "touching: kept with the blob");
+        // They step apart: the other person dissolves over a few frames...
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let mut a = frame(false);
+            keep_central(&mut a, h, w, &[], None, &mut history);
+            assert_eq!(a[20 * w + 60], 1.0, "the kept person never fades");
+            seen.push(a[20 * w + 105]);
+        }
+        assert_eq!(seen, [0.75, 0.5, 0.25, 0.0, 0.0]);
+        // ...but whatever joins the kept blob shows at once.
+        let mut a = frame(true);
+        keep_central(&mut a, h, w, &[], None, &mut history);
+        assert_eq!(a[20 * w + 105], 1.0);
     }
 
     #[test]

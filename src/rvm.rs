@@ -275,17 +275,26 @@ enum Backend {
     Full { sess: Session, rec: Option<Vec<DynValue>>, rec_dsr: f32, load: StageLoad },
 }
 
-/// Single-person mode's inputs for one frame: the newest faces, and the face
+/// What single-person mode carries from frame to frame: the face kept and
+/// the keep weights, so removals fade out instead of popping.
+#[derive(Default)]
+struct Isolation {
+    face: Option<[f32; 2]>,
+    history: Vec<f32>,
+}
+
+/// Single-person mode's inputs for one frame: the newest faces, and what was
 /// kept last frame (shared, as frames finish on another thread).
 pub struct Single {
     faces: Arc<Vec<Face>>,
-    kept: Arc<Mutex<Option<[f32; 2]>>>,
+    kept: Arc<Mutex<Isolation>>,
 }
 
 impl Single {
     fn apply(&self, alpha: &mut [f32], h: usize, w: usize) {
         let mut kept = self.kept.lock().unwrap();
-        *kept = kernels::keep_central(alpha, h, w, &self.faces, *kept);
+        let Isolation { face, history } = &mut *kept;
+        *face = kernels::keep_central(alpha, h, w, &self.faces, *face, history);
     }
 }
 
@@ -338,7 +347,7 @@ pub struct RvmEngine {
     backend: Backend,
     /// Started the first time single-person mode is used.
     faces: Option<FaceTracker>,
-    kept: Arc<Mutex<Option<[f32; 2]>>>,
+    kept: Arc<Mutex<Isolation>>,
 }
 
 impl RvmEngine {
@@ -455,6 +464,10 @@ impl RvmEngine {
 
     /// Live toggle for keeping only the person nearest the centre.
     pub fn set_single_person(&mut self, single: bool) {
+        if single && !self.single {
+            // Start afresh rather than fade from whatever was kept long ago.
+            *self.kept.lock().unwrap() = Isolation::default();
+        }
         self.single = single;
     }
 }

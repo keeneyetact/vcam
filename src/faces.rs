@@ -26,6 +26,10 @@ const MIN_SCORE: f32 = 0.6;
 const NMS_IOU: f32 = 0.3;
 /// How often the tracker looks for faces.
 const INTERVAL: Duration = Duration::from_millis(100);
+/// A face the detector stops finding is still reported this long, so one
+/// missed look doesn't drop the cut between two people for a moment (the
+/// other person popping back in). Faces off the matte are ignored anyway.
+const HOLD: Duration = Duration::from_millis(400);
 
 /// A detected face, in frame pixels: centre and size.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +48,19 @@ impl Face {
         let inter = ix.max(0.0) * iy.max(0.0);
         inter / (self.w * self.h + o.w * o.h - inter)
     }
+}
+
+/// The faces to report after a detection: those `found` now, plus those in
+/// `seen` (each with when it was last found) that weren't found again but
+/// were found within HOLD. Updates `seen`.
+fn hold(seen: &mut Vec<(Face, Instant)>, found: Vec<Face>, now: Instant) -> Vec<Face> {
+    let missed: Vec<(Face, Instant)> = seen
+        .iter()
+        .filter(|(f, t)| now - *t < HOLD && found.iter().all(|g| g.iou(f) <= 0.0))
+        .copied()
+        .collect();
+    *seen = found.iter().map(|&f| (f, now)).chain(missed).collect();
+    seen.iter().map(|&(f, _)| f).collect()
 }
 
 pub struct FaceDetector {
@@ -149,9 +166,18 @@ impl FaceTracker {
                     return;
                 }
             };
+            let mut seen = Vec::new();
+            let mut size = (0, 0);
             while let Ok(frame) = rx.recv() {
+                if size != (frame.w, frame.h) {
+                    seen.clear(); // held faces are in the old frame's pixels
+                    size = (frame.w, frame.h);
+                }
                 match det.detect(&frame) {
-                    Ok(faces) => *out.lock().unwrap() = ((frame.w, frame.h), Arc::new(faces)),
+                    Ok(found) => {
+                        let faces = hold(&mut seen, found, Instant::now());
+                        *out.lock().unwrap() = (size, Arc::new(faces));
+                    }
                     Err(e) => {
                         crate::log!("Face detection failed ({e:#}); turning it off");
                         *out.lock().unwrap() = ((0, 0), Arc::new(Vec::new()));
@@ -197,6 +223,23 @@ impl Drop for FaceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_keeps_a_briefly_missed_face() {
+        let f = |x: f32| Face { x, y: 50.0, w: 40.0, h: 40.0, score: 0.9 };
+        let t0 = Instant::now();
+        let mut seen = Vec::new();
+        assert_eq!(hold(&mut seen, vec![f(100.0), f(300.0)], t0).len(), 2);
+        // The right face is missed once: still reported.
+        let faces = hold(&mut seen, vec![f(104.0)], t0 + Duration::from_millis(100));
+        assert_eq!(faces, vec![f(104.0), f(300.0)]);
+        // A face that moved a little replaces its old self rather than doubling.
+        let faces = hold(&mut seen, vec![f(108.0), f(302.0)], t0 + Duration::from_millis(200));
+        assert_eq!(faces, vec![f(108.0), f(302.0)]);
+        // Gone for longer than HOLD: dropped.
+        let later = t0 + Duration::from_millis(200) + HOLD;
+        assert_eq!(hold(&mut seen, vec![f(108.0)], later), vec![f(108.0)]);
+    }
 
     /// Two copies of a portrait side by side: two faces, one in each half.
     #[test]

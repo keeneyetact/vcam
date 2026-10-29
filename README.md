@@ -292,7 +292,8 @@ Intel iGPUs.
   preset / a lower capture resolution.
 - **A second person/object shows up** → only the person nearest the centre is kept by
   default, even when people touch: their faces are detected and the shared
-  cutout is split between them. Someone whose face isn't visible can't be told
+  cutout is split between them. Anyone removed fades out softly over a few
+  frames rather than being cut away. Someone whose face isn't visible can't be told
   apart from a person they touch. Turn off *Only show one person*
   (`--multi-person` keeps everyone).
 

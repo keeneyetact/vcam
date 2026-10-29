@@ -25,6 +25,7 @@ use vcam::{capture, imgproc, paths, system, virtualcam, Frame};
 
 use crate::library::{self, ThumbCache};
 use crate::settings::Settings;
+use crate::updates::{self, Update};
 
 const OBS_URL: &str = "https://obsproject.com/download";
 
@@ -473,6 +474,9 @@ pub struct App {
     logo: Option<TextureHandle>,
     save_at: Option<Instant>,
     was_focused: bool,
+    /// A newer release to tell the user about (cleared when dismissed).
+    update: Option<Update>,
+    updates_rx: mpsc::Receiver<Update>,
 }
 
 impl App {
@@ -567,6 +571,11 @@ impl App {
             logo,
             save_at: None,
             was_focused: true,
+            update: None,
+            updates_rx: {
+                let repaint = ctx.clone();
+                updates::watch(move || repaint.request_repaint())
+            },
         };
         app.render_thumbs(ctx);
         app.render_gallery(ctx);
@@ -876,6 +885,14 @@ impl App {
             self.import_images(ctx, &dropped);
         }
 
+        if let Ok(up) = self.updates_rx.try_recv() {
+            // Flash the taskbar button if the window is in the background.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+            self.update = Some(up);
+        }
+
         if let Some((_, rx)) = &self.vc_job {
             if let Ok((ok, msg)) = rx.try_recv() {
                 self.vc_job = None;
@@ -1075,6 +1092,37 @@ impl App {
         ui.add_space(14.0);
         ui.label(RichText::new(title).font(semi(12.0)).color(p.muted));
         ui.add_space(2.0);
+    }
+
+    /// "A new version is available" strip above the preview.
+    fn ui_update_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(up) = &self.update else { return };
+        let p = self.pal();
+        let mut dismiss = false;
+        egui::Frame::new()
+            .fill(p.notice)
+            .stroke(Stroke::new(1.0, p.notice_border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("vcam {} is available", up.version)).font(semi(12.5)).color(p.text));
+                    ui.label(
+                        RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).size(12.0).color(p.muted),
+                    );
+                    if Self::link(ui, p, "Download").on_hover_text(&up.url).clicked() {
+                        system::open_url(&up.url);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        dismiss = Self::link(ui, p, "✕").on_hover_text("Dismiss").clicked();
+                    });
+                });
+            });
+        ui.add_space(8.0);
+        if dismiss {
+            self.update = None;
+        }
     }
 
     fn link(ui: &mut egui::Ui, p: &Palette, text: &str) -> Response {
@@ -2051,6 +2099,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 16, right, top: 16, bottom: 8 }))
             .show(ui, |ui| {
+                self.ui_update_notice(ui);
                 let footer_h = 24.0;
                 let avail = ui.available_rect_before_wrap();
                 let prect = Rect::from_min_max(avail.min, pos2(avail.max.x, avail.max.y - footer_h - 8.0));

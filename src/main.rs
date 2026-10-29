@@ -8,6 +8,7 @@
 mod app;
 mod library;
 mod settings;
+mod updates;
 
 use std::path::PathBuf;
 use std::sync::Arc;

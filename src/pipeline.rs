@@ -28,6 +28,8 @@ struct Job {
     /// The engine's deferred post-processing; None == passthrough.
     pending: Option<Pending>,
     upscale: Option<(usize, usize)>,
+    /// A line around this rect (x, y, w, h in `frame` pixels).
+    outline: Option<[usize; 4]>,
 }
 
 pub struct OutputPipeline {
@@ -64,6 +66,10 @@ impl OutputPipeline {
                     if let Some(a) = alpha {
                         imgproc::FLOATS.give(a);
                     }
+                    if let Some(r) = job.outline {
+                        let t = (out.h / 180).max(2);
+                        imgproc::draw_outline(Arc::make_mut(&mut out), r, t, [0, 0, 255]);
+                    }
                     if let Some((w, h)) = job.upscale.filter(|&s| s != out.size()) {
                         // Cover-fit: crops rather than stretches if the camera
                         // couldn't deliver the output's aspect ratio.
@@ -96,14 +102,14 @@ impl OutputPipeline {
     /// Hand one frame's render + send to the worker. Blocks (back-pressure) if
     /// the worker is two frames behind; fails if the worker has failed.
     pub fn submit(&self, compositor: Arc<Compositor>, frame: Arc<Frame>, pending: Option<Pending>,
-                  upscale: Option<(usize, usize)>) -> Result<()> {
+                  upscale: Option<(usize, usize)>, outline: Option<[usize; 4]>) -> Result<()> {
         if let Some(e) = self.error() {
             bail!(e);
         }
         self.tx
             .as_ref()
             .ok_or_else(|| anyhow!("output closed"))?
-            .send(Job { compositor, frame, pending, upscale })
+            .send(Job { compositor, frame, pending, upscale, outline })
             .map_err(|_| anyhow!("output thread stopped"))
     }
 

@@ -465,6 +465,7 @@ pub struct App {
     blur_image: bool,
     blur: f32,
     realistic: bool,
+    outline: bool,
     speed: usize,
     quality: usize,
     one_person: bool,
@@ -563,6 +564,7 @@ impl App {
             blur_image: s.blur_image,
             blur: s.blur_strength.map_or(BLUR_DEFAULT, |v| (v as f32).clamp(BLUR_MIN, BLUR_MAX)),
             realistic: s.realistic,
+            outline: s.outline,
             speed: SPEED_MODES.iter().position(|m| m.0 == s.speed).unwrap_or(0),
             quality: QUALITY_PRESETS.iter().position(|q| q.0 == s.quality).unwrap_or(QUALITY_DEFAULT),
             one_person: s.one_person,
@@ -622,6 +624,7 @@ impl App {
             blur_image: self.blur_image,
             blur_strength: Some(self.blur as f64),
             realistic: self.realistic,
+            outline: self.outline,
             speed: SPEED_MODES[self.speed].0.into(),
             quality: QUALITY_PRESETS[self.quality].0.into(),
             one_person: self.one_person,
@@ -853,6 +856,7 @@ impl App {
             c.blur_image = self.blur_image;
             c.blur_strength = self.blur;
             c.realistic = self.realistic;
+            c.outline = self.outline;
             c.mirror = self.mirror;
             c.multi_person = !self.one_person;
             c.exposure = exposure_mode(self.keep_frame_rate);
@@ -1458,6 +1462,14 @@ impl App {
                 .changed()
             {
                 self.apply_bg(&ctx);
+            }
+            if Self::switch(ui, p, &mut self.outline, "Show camera outline")
+                .on_hover_text("A red line around your camera picture in the virtual camera.")
+                .changed()
+            {
+                let on = self.outline;
+                self.worker.configure(|c| c.outline = on);
+                self.schedule_save();
             }
             ui.add_space(6.0);
             if let Some(path) = self.bg_path.clone() {

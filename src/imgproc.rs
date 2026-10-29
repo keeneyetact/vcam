@@ -413,16 +413,23 @@ pub fn frame_camera(img: &Frame, framing: &Framing, w: usize, h: usize) -> Frame
     frame_with(img, framing, w, h, false)
 }
 
-fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides: bool) -> Frame {
+/// Where `frame_camera` puts a picture of `iw`x`ih` in its `w`x`h` frame:
+/// x, y, w, h in frame pixels.
+pub fn camera_rect(framing: &Framing, w: usize, h: usize, iw: usize, ih: usize) -> [usize; 4] {
+    layout(framing, w, h, iw, ih).1
+}
+
+/// The crop of the picture (x, y, w, h in its pixels) and where it goes in
+/// the frame.
+fn layout(framing: &Framing, w: usize, h: usize, iw: usize, ih: usize) -> ([usize; 4], [usize; 4]) {
     let px = |v: f32, n: usize| ((v * n as f32).round().max(0.0) as usize).min(n);
     // The place, in frame pixels.
     let p = Framing::clamped(framing.place);
     let (tx, ty) = (px(p[0], w).min(w - 1), px(p[1], h).min(h - 1));
     let (tw, th) = ((px(p[2], w).max(tx + 1)) - tx, (px(p[3], h).max(ty + 1)) - ty);
-    let [x0, y0, x1, y1] = framing.effective_crop(img.w, img.h, tw as f32 / th as f32);
-    let (cx, cy) = (px(x0, img.w).min(img.w - 1), px(y0, img.h).min(img.h - 1));
-    let (cw, ch) = ((px(x1, img.w).max(cx + 1)) - cx, (px(y1, img.h).max(cy + 1)) - cy);
-    let region = crop(img, cx, cy, cw, ch);
+    let [x0, y0, x1, y1] = framing.effective_crop(iw, ih, tw as f32 / th as f32);
+    let (cx, cy) = (px(x0, iw).min(iw - 1), px(y0, ih).min(ih - 1));
+    let (cw, ch) = ((px(x1, iw).max(cx + 1)) - cx, (px(y1, ih).max(cy + 1)) - cy);
     // The crop sized into the place (Fit: centred in it).
     let (fw, fh) = if framing.fit == FitMode::Fit {
         let k = (tw as f64 / cw as f64).min(th as f64 / ch as f64);
@@ -430,6 +437,33 @@ fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides:
     } else {
         (tw, th)
     };
+    ([cx, cy, cw, ch], [tx + (tw - fw) / 2, ty + (th - fh) / 2, fw, fh])
+}
+
+/// A `t`-pixel line just inside the rect (x, y, w, h), in `bgr`.
+pub fn draw_outline(img: &mut Frame, [x, y, rw, rh]: [usize; 4], t: usize, bgr: [u8; 3]) {
+    let (x1, y1) = ((x + rw).min(img.w), (y + rh).min(img.h));
+    if x >= x1 || y >= y1 {
+        return;
+    }
+    let t = t.min((x1 - x) / 2).min((y1 - y) / 2).max(1);
+    let w = img.w;
+    let mut fill = |xa: usize, xb: usize, ya: usize, yb: usize| {
+        for row in ya..yb {
+            for px in img.data[(row * w + xa) * 3..(row * w + xb) * 3].chunks_exact_mut(3) {
+                px.copy_from_slice(&bgr);
+            }
+        }
+    };
+    fill(x, x1, y, y + t);
+    fill(x, x1, y1 - t, y1);
+    fill(x, x + t, y, y1);
+    fill(x1 - t, x1, y, y1);
+}
+
+fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides: bool) -> Frame {
+    let ([cx, cy, cw, ch], [ox, oy, fw, fh]) = layout(framing, w, h, img.w, img.h);
+    let region = crop(img, cx, cy, cw, ch);
     let fg = resize(&region, fw, fh);
     if (fw, fh) == (w, h) {
         return fg;
@@ -442,7 +476,6 @@ fn frame_with(img: &Frame, framing: &Framing, w: usize, h: usize, blurred_sides:
     } else {
         Frame::new(w, h)
     };
-    let (ox, oy) = (tx + (tw - fw) / 2, ty + (th - fh) / 2);
     out.data[oy * w * 3..(oy + fh) * w * 3].par_chunks_mut(w * 3).enumerate().for_each(|(r, o)| {
         o[ox * 3..(ox + fw) * 3].copy_from_slice(&fg.data[r * fw * 3..][..fw * 3]);
     });

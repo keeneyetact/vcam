@@ -64,6 +64,9 @@ pub struct Config {
     /// Match the picture background to the live camera (light, focus,
     /// grain, light wrap) so it reads as the real room.
     pub realistic: bool,
+    /// Draw a line around the camera picture in the output (picture
+    /// background only).
+    pub outline: bool,
     pub mirror: bool,
     pub multi_person: bool,
     /// RVM downsample_ratio; None == automatic (`autotune`: the finest this
@@ -96,6 +99,7 @@ impl Default for Config {
             blur_image: false,
             blur_strength: 1.0,
             realistic: true,
+            outline: false,
             mirror: false,
             multi_person: false,
             downsample: None,
@@ -590,7 +594,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             continue;
         };
         last_seq = seq;
-        let (load, mirror, bright, want_dsr, multi, cam_framing) = {
+        let (load, mirror, bright, want_dsr, multi, cam_framing, outline) = {
             let mut bg = sh.bg.lock().unwrap();
             let cfg = sh.cfg.lock().unwrap();
             let mut load = None;
@@ -603,7 +607,8 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             if let Some(c) = bg.pending.take() {
                 compositor = c;
             }
-            (load, cfg.mirror, cfg.brightness, cfg.downsample, cfg.multi_person, cfg.camera_framing)
+            let outline = cfg.outline && cfg.mode == BgMode::Image;
+            (load, cfg.mirror, cfg.brightness, cfg.downsample, cfg.multi_person, cfg.camera_framing, outline)
         };
         if let Some((gen, c)) = load {
             load_compositor_async(sh, gen, c, w, h);
@@ -629,6 +634,11 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             grabber.set_region(cam_framing.effective_crop(w, h, cam_framing.target_aspect(w as f32 / h as f32)));
             measured = Some(cam_framing);
         }
+        // Where the camera picture lands, mirrored with it, for the outline.
+        let outline = outline.then(|| {
+            let [x, y, pw, ph] = imgproc::camera_rect(&cam_framing, w, h, frame.w, frame.h);
+            [if mirror { w - x - pw } else { x }, y, pw, ph]
+        });
         // Camera framing first, on the camera's own picture: everything from
         // here on -- brightness, mirror, matting, faces, the room matching,
         // the output -- sees only the crop, sized into its place in a frame of
@@ -648,7 +658,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         if compositor.is_passthrough() {
             // Original camera: skip matting entirely (saves the CPU); the
             // engine stays loaded so switching back is instant.
-            pipeline.submit(compositor.clone(), frame, None, upscale)?;
+            pipeline.submit(compositor.clone(), frame, None, upscale, outline)?;
         } else {
             // Live, in-place option changes (no rebuild needed).
             match want_dsr {
@@ -668,7 +678,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             // Only inference runs here; the post-processing happens on the
             // output thread, overlapping the next inference.
             let pending = engine.infer(frame.clone())?;
-            pipeline.submit(compositor.clone(), frame, Some(pending), upscale)?;
+            pipeline.submit(compositor.clone(), frame, Some(pending), upscale, outline)?;
         }
         frames += 1;
         if frames % 15 == 0 {

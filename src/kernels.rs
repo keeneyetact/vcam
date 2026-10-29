@@ -223,10 +223,8 @@ fn pick_central(area: &[u32], sum2x: &[u64], sum2y: &[u64], h: usize, w: usize) 
 /// How much nearer the centre another face must be to take over from the one
 /// kept last frame, as a fraction of the frame width (stops flip-flopping).
 const STICKINESS: f32 = 0.08;
-/// Vertical distances count this much (squared) when splitting a blob between
-/// two faces: bodies hang below heads, so the cut leans towards vertical.
-const CUT_VERTICAL: f32 = 0.1;
-/// Width of the soft edge along a cut, as a fraction of the kept face width.
+/// Width of the soft edge where a shared blob is split between two people,
+/// as a fraction of the kept face width.
 const CUT_SOFTNESS: f32 = 0.25;
 /// Labelling-resolution px over which the matte fades out past the kept
 /// blob's dilated edge: removing the rest along a hard line reads as a
@@ -237,31 +235,59 @@ const FADE: usize = 6;
 /// once, so the kept person is never held back.
 const FADE_OUT_STEP: f32 = 0.25;
 
-/// A straight cut through a blob shared by two people: alpha is kept where
-/// `(x - mx) * nx + (y - my) * ny` is negative, fading out over `soft` px.
-struct Cut {
-    mx: f32,
-    my: f32,
-    nx: f32,
-    ny: f32,
-    soft: f32,
+/// Distances in px, 8-connected, from the `seeds` through the pixels where
+/// `inside` is set (u32::MAX where unreachable).
+fn geodesic(inside: &[u8], sh: usize, sw: usize, seeds: impl Iterator<Item = usize>) -> Vec<u32> {
+    let mut dist = vec![u32::MAX; sh * sw];
+    let mut queue = std::collections::VecDeque::new();
+    for i in seeds {
+        if inside[i] != 0 && dist[i] != 0 {
+            dist[i] = 0;
+            queue.push_back(i);
+        }
+    }
+    while let Some(i) = queue.pop_front() {
+        let (y, x) = (i / sw, i % sw);
+        for yy in y.saturating_sub(1)..(y + 2).min(sh) {
+            for xx in x.saturating_sub(1)..(x + 2).min(sw) {
+                let j = yy * sw + xx;
+                if inside[j] != 0 && dist[j] == u32::MAX {
+                    dist[j] = dist[i] + 1;
+                    queue.push_back(j);
+                }
+            }
+        }
+    }
+    dist
 }
 
-impl Cut {
-    /// Between the kept face `t` and another face `f`, nearer `t` the
-    /// smaller its face is.
-    fn between(t: &Face, f: &Face) -> Cut {
-        let k = t.w / (t.w + f.w);
-        let (mx, my) = (t.x + (f.x - t.x) * k, t.y + (f.y - t.y) * k);
-        let (nx, ny) = (f.x - t.x, (f.y - t.y) * CUT_VERTICAL);
-        let len = nx.hypot(ny).max(1e-6);
-        Cut { mx, my, nx: nx / len, ny: ny / len, soft: (t.w * CUT_SOFTNESS).max(1.0) }
-    }
-
-    #[inline]
-    fn weight(&self, x: f32, y: f32) -> f32 {
-        (0.5 - ((x - self.mx) * self.nx + (y - self.my) * self.ny) / self.soft).clamp(0.0, 1.0)
-    }
+/// Splits a blob shared by the kept face `t` and the `others` touching it:
+/// each pixel goes to the face it's nearest *through the blob*, so the split
+/// follows people's shapes -- an arm stays with its own body -- where a
+/// straight line would chop through an arm or leave a hand floating. Returns
+/// the keep weight of each low-res pixel: 1 outside the blob, and across it
+/// fading from 1 to 0 over `soft` px either side of the split.
+fn split_blob(inside: &[u8], sh: usize, sw: usize, scale: [f32; 2], t: &Face, others: &[&Face], soft: f32) -> Vec<f32> {
+    // Seeds: the face box down to the chin, where it lies on the blob.
+    let seeds = |f: &Face| {
+        let [sx, sy] = scale;
+        let xs = ((f.x - f.w / 2.0) * sx).max(0.0) as usize..(((f.x + f.w / 2.0) * sx).max(0.0) as usize + 1).min(sw);
+        let ys = ((f.y - f.h / 2.0) * sy).max(0.0) as usize..(((f.y + 0.6 * f.h) * sy).max(0.0) as usize + 1).min(sh);
+        ys.flat_map(move |y| xs.clone().map(move |x| y * sw + x))
+    };
+    let mine = geodesic(inside, sh, sw, seeds(t));
+    let theirs = geodesic(inside, sh, sw, others.iter().flat_map(|f| seeds(f)));
+    mine.iter()
+        .zip(&theirs)
+        .zip(inside)
+        .map(|((&d, &e), &i)| {
+            if i == 0 || d == u32::MAX {
+                return 1.0;
+            }
+            let lead = e.min(1 << 20) as f32 - d.min(1 << 20) as f32; // > 0: nearer the kept face
+            (0.5 + lead / soft).clamp(0.0, 1.0)
+        })
+        .collect()
 }
 
 /// Keep only one person in an HxW matte, in place; fade out the rest while
@@ -271,8 +297,9 @@ impl Cut {
 ///
 /// With `faces` (frame pixels), the person is the face on the matte nearest
 /// the frame centre -- favouring `prev`, the one kept last time -- and if
-/// other faces share its blob (people touching), the blob is cut between
-/// them. Without, it's the blob nearest the centre. Returns the face kept, or
+/// other faces share its blob (people touching), the blob is split between
+/// them along the matte (see `split_blob`). Without, it's the blob nearest the
+/// centre. Returns the face kept, or
 /// `prev` when no face was usable.
 pub fn keep_central(
     a: &mut [f32],
@@ -403,15 +430,31 @@ pub fn keep_central(
         };
         d(f).total_cmp(&d(g))
     });
-    let (central, cuts, kept_face) = match target {
-        Some((t, l)) => {
-            let cuts: Vec<Cut> =
-                on.iter().filter(|&&(f, m)| m == l && !std::ptr::eq(f, t)).map(|(f, _)| Cut::between(t, f)).collect();
-            (l, cuts, Some([t.x, t.y]))
-        }
-        None => (pick_central(&area, &sum2x, &sum2y, sh, sw), Vec::new(), prev),
+    let (central, kept_face) = match target {
+        Some((t, l)) => (l, Some([t.x, t.y])),
+        None => (pick_central(&area, &sum2x, &sum2y, sh, sw), prev),
     };
     let kept = |i: usize| parent[i] as usize == central;
+
+    // Split the blob if others' faces are on it too.
+    let split = target.and_then(|(t, l)| {
+        let others: Vec<&Face> = on.iter().filter(|&&(f, m)| m == l && !std::ptr::eq(f, t)).map(|&(f, _)| f).collect();
+        if others.is_empty() {
+            return None;
+        }
+        let mut inside = vec![0u8; sh * sw];
+        for y in 0..sh {
+            for i in (row_at[y]..row_at[y + 1]).filter(|&i| kept(i)) {
+                inside[y * sw + runs[i].0 as usize..y * sw + runs[i].1 as usize].fill(1);
+            }
+        }
+        let scale = [sw as f32 / w as f32, sh as f32 / h as f32];
+        let soft = (t.w * CUT_SOFTNESS * scale[0]).max(2.0);
+        Some(split_blob(&inside, sh, sw, scale, t, &others, soft))
+    });
+    // A pixel of the blob is the kept person's own (and is dilated) where the
+    // split gives it at least half.
+    let own = |y: usize, x: usize| split.as_ref().is_none_or(|s| s[y * sw + x] >= 0.5);
 
     // The blob's bounding box: nothing outside it (+5 px of dilation, + the
     // fade) is kept this frame.
@@ -437,8 +480,8 @@ pub fn keep_central(
             for i in (row_at[y]..row_at[y + 1]).filter(|&i| kept(i)) {
                 let (s, e) = (runs[i].0 as usize, runs[i].1 as usize);
                 p[x + 1..=s].fill(acc);
-                for v in &mut p[s + 1..=e] {
-                    acc += 1;
+                for (xx, v) in (s..e).zip(&mut p[s + 1..=e]) {
+                    acc += own(y, xx) as u32;
                     *v = acc;
                 }
                 x = e;
@@ -470,7 +513,7 @@ pub fn keep_central(
 
     // Keep weights: 1 on the dilated blob, easing to 0 over FADE px past it
     // (a box blur of the blob, doubled so it's 1 at the blob's edge, then
-    // smoothstepped), times the soft cuts between touching people.
+    // smoothstepped), times the soft split between touching people.
     let side = 2 * FADE + 1;
     let mut hsum = U32S.zeroed(sh * sw);
     pool().install(|| {
@@ -489,7 +532,6 @@ pub fn keep_central(
             },
         );
     });
-    let (fx, fy) = (w as f32 / sw as f32, h as f32 / sh as f32);
     let mut weight = FLOATS.zeroed(sh * sw);
     pool().install(|| {
         weight.par_chunks_mut(sw).enumerate().for_each(|(y, row)| {
@@ -505,10 +547,8 @@ pub fn keep_central(
                     let t = (2.0 * n as f32 / (side * side) as f32).min(1.0);
                     t * t * (3.0 - 2.0 * t)
                 };
-                if *v > 0.0 {
-                    for c in &cuts {
-                        *v *= c.weight((x as f32 + 0.5) * fx, (y as f32 + 0.5) * fy);
-                    }
+                if let Some(s) = &split {
+                    *v *= s[y * sw + x];
                 }
             }
         });
@@ -832,6 +872,32 @@ mod tests {
         assert_eq!(a[100 * w + 160], 0.0, "other body");
         // The cut sits halfway between equal faces, with a soft edge.
         assert!(a[100 * w + 105] > 0.0 && a[100 * w + 105] < 1.0);
+    }
+
+    #[test]
+    fn keep_central_split_follows_arms() {
+        // Two people touching only at the bottom; each reaches an arm past the
+        // half-way line towards the other, without touching them.
+        let (h, w) = (140, 200);
+        let mut a = vec![0f32; h * w];
+        for y in 0..h {
+            for x in 0..w {
+                let head = |cx: usize| (x as isize - cx as isize).pow(2) + (y as isize - 25).pow(2) <= 15 * 15;
+                let body = y >= 40 && ((30..80).contains(&x) || (120..170).contains(&x));
+                let bridge = y >= 120 && (80..120).contains(&x);
+                let kept_arm = (50..56).contains(&y) && (80..112).contains(&x);
+                let other_arm = (80..86).contains(&y) && (88..120).contains(&x);
+                if head(55) || head(145) || body || bridge || kept_arm || other_arm {
+                    a[y * w + x] = 1.0;
+                }
+            }
+        }
+        let faces = [face(55.0, 25.0, 30.0), face(145.0, 25.0, 30.0)];
+        assert_eq!(keep_central(&mut a, h, w, &faces, Some([55.0, 25.0]), &mut Vec::new()), Some([55.0, 25.0]));
+        assert_eq!(a[53 * w + 108], 1.0, "the kept person's hand, past half-way, stays");
+        assert_eq!(a[83 * w + 92], 0.0, "the other person's hand, past half-way, goes");
+        assert_eq!(a[100 * w + 50], 1.0, "kept body");
+        assert_eq!(a[100 * w + 150], 0.0, "other body");
     }
 
     #[test]

@@ -35,10 +35,12 @@ struct Args {
     /// Solid colour background, e.g. 0,177,64
     #[arg(long, value_name = "R,G,B", value_parser = parse_color)]
     color: Option<[u8; 3]>,
-    /// RVM internal downsample_ratio 0-1 (default 0.375; lower = faster, softer hair)
+    /// RVM internal downsample_ratio 0-1 (default: automatic, the finest this PC
+    /// keeps up with; lower = faster, softer hair)
     #[arg(long, value_parser = parse_downsample)]
     downsample: Option<f32>,
-    /// CPU threads per RVM stage (default: min(8, cores); more can be slower)
+    /// CPU threads per RVM stage (default: this PC's fast cores, at most 8; more
+    /// can be slower)
     #[arg(long)]
     threads: Option<usize>,
     /// Webcam index (see --list-cameras)

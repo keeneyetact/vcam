@@ -39,21 +39,32 @@ const SPEED_MODES: [(&str, usize, usize, Option<usize>, Option<usize>); 2] = [
 ];
 
 /// label -> RVM downsample_ratio (the quality<->speed dial; resolution
-/// unchanged). Higher = sharper hair/edges but slower. Above ~0.5 you leave
-/// RVM's trained coarse-resolution range, so the matte barely gets sharper
-/// while speed craters; the two slowest rows are there so you can judge for
-/// yourself, "Fine" is the practical sharpest.
-const QUALITY_PRESETS: [(&str, f32); 8] = [
-    ("Finest (very slow)", 0.75),
-    ("Extra fine (slow)", 0.60),
-    ("Fine", 0.50),
-    ("Sharper", 0.40),
-    ("Balanced (recommended)", 0.375),
-    ("Smoother", 0.30),
-    ("Fast", 0.25),
-    ("Fastest", 0.20),
+/// unchanged), None == Auto: the finest this PC keeps up with, re-fitted
+/// while running. Higher = sharper hair/edges but slower. Above ~0.5 you
+/// leave RVM's trained coarse-resolution range, so the matte barely gets
+/// sharper while speed craters; the two slowest rows are there so you can
+/// judge for yourself, "Fine" is the practical sharpest (and Auto's limit).
+const QUALITY_PRESETS: [(&str, Option<f32>); 9] = [
+    ("Auto — best for this PC", None),
+    ("Finest (very slow)", Some(0.75)),
+    ("Extra fine (slow)", Some(0.60)),
+    ("Fine", Some(0.50)),
+    ("Sharper", Some(0.40)),
+    ("Balanced", Some(0.375)),
+    ("Smoother", Some(0.30)),
+    ("Fast", Some(0.25)),
+    ("Fastest", Some(0.20)),
 ];
-const QUALITY_DEFAULT: usize = 4;
+const QUALITY_DEFAULT: usize = 0;
+
+/// The preset name for a ratio Auto picked.
+fn quality_name(dsr: f32) -> &'static str {
+    QUALITY_PRESETS
+        .iter()
+        .filter_map(|(name, d)| d.map(|d| (*name, d)))
+        .min_by(|a, b| (a.1 - dsr).abs().total_cmp(&(b.1 - dsr).abs()))
+        .map_or("Balanced", |(name, _)| name)
+}
 
 /// The "Keep full frame rate in dim light" switch: on, the exposure is fixed
 /// only once dim light actually slows the camera.
@@ -846,7 +857,7 @@ impl App {
             c.multi_person = !self.one_person;
             c.exposure = exposure_mode(self.keep_frame_rate);
             c.brightness = self.brightness;
-            c.downsample = Some(QUALITY_PRESETS[self.quality].1);
+            c.downsample = QUALITY_PRESETS[self.quality].1;
             (c.width, c.height, c.out_width, c.out_height) = (cw, ch, ow, oh);
         });
         self.worker.start();
@@ -1997,12 +2008,21 @@ impl App {
                 }
             })
             .response
-            .on_hover_text("Finer = crisper hair and edges but more CPU. Applies instantly.");
+            .on_hover_text(
+                "Finer = crisper hair and edges but more CPU. Auto picks the finest this PC keeps \
+                 at full frame rate, and adjusts if the PC gets busier. Applies instantly.",
+            );
         if self.quality != before {
             // Live quality<->speed balance; takes effect on the next frame.
             self.worker.set_quality(QUALITY_PRESETS[self.quality].1);
             self.schedule_save();
         }
+        let m = vcam::hw::machine();
+        let now = match (QUALITY_PRESETS[self.quality].1, self.worker.quality()) {
+            (None, Some(dsr)) => format!("Auto is using {}. ", quality_name(dsr)),
+            _ => String::new(),
+        };
+        ui.label(RichText::new(format!("{now}This PC: {}, {}.", m.cpu, m.summary())).size(12.0).color(p.muted));
 
         ui.add_space(6.0);
         if Self::switch(ui, p, &mut self.one_person, "Only show one person")

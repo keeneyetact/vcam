@@ -9,10 +9,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
+use crate::autotune::{self, AutoQuality};
 use crate::capture::{CameraInfo, ExposureMode, FrameGrabber};
 use crate::compositor::Compositor;
 use crate::imgproc::{self, Frame, Framing};
-use crate::kernels;
+use crate::{hw, kernels};
 use crate::pipeline::OutputPipeline;
 use crate::rvm::RvmEngine;
 use crate::virtualcam::VirtualCam;
@@ -65,7 +66,8 @@ pub struct Config {
     pub realistic: bool,
     pub mirror: bool,
     pub multi_person: bool,
-    /// RVM downsample_ratio; None == automatic.
+    /// RVM downsample_ratio; None == automatic (`autotune`: the finest this
+    /// PC sustains at the camera's rate).
     pub downsample: Option<f32>,
     pub threads: Option<usize>,
     /// How the webcam's exposure is handled; auto-exposure alone slows many
@@ -160,6 +162,8 @@ struct Info {
     running: bool,
     error: Option<String>,
     fps: f32,
+    /// The downsample_ratio in use (Auto's current pick), while running.
+    quality: Option<f32>,
     device: Option<String>,
     camera: Option<CameraInfo>,
 }
@@ -197,7 +201,7 @@ impl VCamWorker {
         let shared = Shared {
             cfg: Mutex::new(cfg),
             bg: Mutex::new(BgState::default()),
-            info: Mutex::new(Info { status: Status::Stopped, running: false, error: None, fps: 0.0, device: None, camera: None }),
+            info: Mutex::new(Info { status: Status::Stopped, running: false, error: None, fps: 0.0, quality: None, device: None, camera: None }),
             stop: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             preview_box: Mutex::new(None),
@@ -263,9 +267,10 @@ impl VCamWorker {
         self.shared.bg.lock().unwrap().dirty = true;
     }
 
-    /// Live quality/speed balance (RVM downsample_ratio), from the next frame.
-    pub fn set_quality(&self, downsample: f32) {
-        self.configure(|c| c.downsample = Some(downsample));
+    /// Live quality/speed balance (RVM downsample_ratio, None == automatic),
+    /// from the next frame.
+    pub fn set_quality(&self, downsample: Option<f32>) {
+        self.configure(|c| c.downsample = downsample);
     }
 
     pub fn status(&self) -> Status {
@@ -282,6 +287,11 @@ impl VCamWorker {
 
     pub fn fps(&self) -> f32 {
         self.shared.info.lock().unwrap().fps
+    }
+
+    /// The downsample_ratio in use, while running.
+    pub fn quality(&self) -> Option<f32> {
+        self.shared.info.lock().unwrap().quality
     }
 
     /// Name of the virtual camera being fed, while running.
@@ -380,6 +390,7 @@ fn thread_main(sh: &Arc<Shared>) {
         info.status = Status::Stopped;
     }
     info.running = false;
+    info.quality = None;
     info.device = None;
     info.camera = None;
     drop(info);
@@ -493,7 +504,10 @@ fn store_latest(sh: &Shared, out: &Arc<Frame>) {
 }
 
 fn make_engine(cfg: &Config, w: usize, h: usize) -> Result<RvmEngine> {
-    let engine = RvmEngine::new(w, h, cfg.downsample, !cfg.multi_person, cfg.threads)
+    let m = hw::machine();
+    crate::log!("CPU: {} ({})", m.cpu, m.summary());
+    let dsr = cfg.downsample.unwrap_or_else(|| autotune::initial(m, w, h));
+    let engine = RvmEngine::new(w, h, Some(dsr), !cfg.multi_person, cfg.threads)
         .map_err(|e| e.context("RVM engine failed to start"))?;
     crate::log!(
         "Engine: RobustVideoMatting (downsample_ratio={:.2}, CPU x{} threads{})",
@@ -507,7 +521,7 @@ fn make_engine(cfg: &Config, w: usize, h: usize) -> Result<RvmEngine> {
 fn run_session(sh: &Arc<Shared>) -> Result<()> {
     let cfg = sh.cfg.lock().unwrap().clone();
     let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure)?;
-    let (w, h) = (cam_info.width, cam_info.height);
+    let (w, h, cam_fps) = (cam_info.width, cam_info.height, cam_info.fps);
     crate::log!("Capturing {w}x{h} {} @ {:.0} fps from '{}'", cam_info.format, cam_info.fps, cam_info.name);
     if let Some(e) = cam_info.exposure {
         crate::log!("Exposure fixed at 1/{} s to hold the frame rate", 1u32 << -e.min(0));
@@ -563,6 +577,8 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
     let mut lut: Option<((f32, f32), [u8; 256])> = None;
     // The camera framing the capture thread last measured brightness for.
     let mut measured: Option<Framing> = None;
+    // Fits the edge detail to this PC while the quality is on Auto.
+    let mut auto: Option<AutoQuality> = None;
     while !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed) {
         if let Some(e) = pipeline.error() {
             anyhow::bail!(e);
@@ -635,8 +651,18 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             pipeline.submit(compositor.clone(), frame, None, upscale)?;
         } else {
             // Live, in-place option changes (no rebuild needed).
-            if let Some(d) = want_dsr {
-                engine.set_downsample(d);
+            match want_dsr {
+                Some(d) => {
+                    auto = None;
+                    engine.set_downsample(d);
+                }
+                None => {
+                    let a = auto.get_or_insert_with(|| AutoQuality::new(engine.dsr, cam_fps, Instant::now()));
+                    if let Some(d) = a.poll(Instant::now(), || engine.stage_time()) {
+                        crate::log!("Auto quality: downsample_ratio {:.3} -> {d:.3}", engine.dsr);
+                        engine.set_downsample(d);
+                    }
+                }
             }
             engine.set_single_person(!multi);
             // Only inference runs here; the post-processing happens on the
@@ -648,7 +674,10 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         if frames % 15 == 0 {
             // The current rate, not the session's average: it moves when
             // the camera's rate does (e.g. the adaptive exposure kicking in).
-            sh.info.lock().unwrap().fps = 15.0 / since.elapsed().as_secs_f32();
+            let mut info = sh.info.lock().unwrap();
+            info.fps = 15.0 / since.elapsed().as_secs_f32();
+            info.quality = Some(engine.dsr);
+            drop(info);
             since = Instant::now();
         }
     }

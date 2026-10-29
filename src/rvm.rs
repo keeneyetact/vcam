@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
@@ -29,11 +30,37 @@ pub fn ort_env() -> Result<&'static ort::environment::Environment> {
         .map_err(|e| anyhow!("onnxruntime failed to start: {e}"))
 }
 
-/// A good intra-op thread count for RVM: enough to use the fast cores, capped
+/// A good intra-op thread count for RVM: one per fast physical core (P-cores
+/// on a hybrid CPU; hyperthreads and E-cores only add contention), capped
 /// because more threads *slow* this small recurrent net (on a 20-core
 /// i7-14700, 28 threads = 77 ms vs 8 threads = 48 ms).
 pub fn default_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8)
+    crate::hw::machine().fast_cores.clamp(2, 8)
+}
+
+/// Time spent running each stage, for `RvmEngine::stage_time`.
+#[derive(Default)]
+struct StageLoad {
+    busy_ns: [AtomicU64; 3],
+    runs: [AtomicU64; 3],
+}
+
+impl StageLoad {
+    fn add(&self, k: usize, d: Duration) {
+        self.busy_ns[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+        self.runs[k].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The slowest stage's mean run time since the last call.
+    fn take(&self) -> Option<Duration> {
+        (0..3)
+            .filter_map(|k| {
+                let runs = self.runs[k].swap(0, Ordering::Relaxed);
+                let ns = self.busy_ns[k].swap(0, Ordering::Relaxed);
+                (runs > 0).then(|| Duration::from_nanos(ns / runs))
+            })
+            .max()
+    }
 }
 
 fn build_session(model: &Path, threads: usize) -> Result<Session> {
@@ -85,6 +112,7 @@ pub struct StagePipeline {
     tx: Option<SyncSender<Job>>,
     threads: Vec<JoinHandle<()>>,
     error: Arc<Mutex<Option<String>>>,
+    load: Arc<StageLoad>,
 }
 
 impl StagePipeline {
@@ -94,6 +122,7 @@ impl StagePipeline {
             sessions.push(build_session(p, t)?);
         }
         let error = Arc::new(Mutex::new(None::<String>));
+        let load = Arc::new(StageLoad::default());
         // Capacity 1: bounded latency, and back-pressure reaches the caller.
         let (tx0, mut rx) = mpsc::sync_channel::<Job>(1);
         let mut handles = Vec::new();
@@ -103,6 +132,7 @@ impl StagePipeline {
             let input_names: Vec<String> = sess.inputs().iter().map(|i| i.name().to_string()).collect();
             let output_names: Vec<String> = sess.outputs().iter().map(|o| o.name().to_string()).collect();
             let err = error.clone();
+            let load = load.clone();
             let my_rx = std::mem::replace(&mut rx, next_rx);
             let h = std::thread::Builder::new().name(format!("rvm-stage-{k}")).spawn(move || {
                 let mut rec: Option<Vec<Arc<DynValue>>> = None;
@@ -113,7 +143,9 @@ impl StagePipeline {
                         let _ = reply.send(Err(anyhow!(e))); // an earlier frame failed
                         continue;
                     }
+                    let t0 = Instant::now();
                     let r = run_stage(k, &mut sess, &input_names, &output_names, &mut rec, &mut last_dsr, job);
+                    load.add(k, t0.elapsed());
                     match r {
                         Ok(Some(job)) => {
                             if let Some(n) = &next {
@@ -130,7 +162,7 @@ impl StagePipeline {
             })?;
             handles.push(h);
         }
-        Ok(Self { tx: Some(tx0), threads: handles, error })
+        Ok(Self { tx: Some(tx0), threads: handles, error, load })
     }
 
     /// Queue one frame's input; returns where its (A, b) will arrive. Blocks
@@ -240,7 +272,7 @@ enum Backend {
         pool_rx: Receiver<Tensor<f32>>,
     },
     /// The stock model in one session (fallback if the stages can't be built).
-    Full { sess: Session, rec: Option<Vec<DynValue>>, rec_dsr: f32 },
+    Full { sess: Session, rec: Option<Vec<DynValue>>, rec_dsr: f32, load: StageLoad },
 }
 
 /// Single-person mode's inputs for one frame: the newest faces, and the face
@@ -331,7 +363,7 @@ impl RvmEngine {
                     std::fs::write(&path, &full)?;
                 }
                 let path = models::find_model(models::RVM_FILE).unwrap_or(path);
-                Backend::Full { sess: build_session(&path, threads)?, rec: None, rec_dsr: dsr }
+                Backend::Full { sess: build_session(&path, threads)?, rec: None, rec_dsr: dsr, load: StageLoad::default() }
             }
         };
         Ok(Self { w, h, dsr, threads, single: single_person, backend, faces: None, kept: Arc::default() })
@@ -339,6 +371,15 @@ impl RvmEngine {
 
     pub fn staged(&self) -> bool {
         matches!(self.backend, Backend::Staged { .. })
+    }
+
+    /// The slowest stage's mean inference time per frame since the last call
+    /// (None if nothing ran): what bounds the frame rate, for `autotune`.
+    pub fn stage_time(&self) -> Option<Duration> {
+        match &self.backend {
+            Backend::Staged { pipe, .. } => pipe.load.take(),
+            Backend::Full { load, .. } => load.take(),
+        }
     }
 
     /// The serial half: input conversion + inference. Only this has to run
@@ -361,7 +402,7 @@ impl RvmEngine {
                 let rx = pipe.submit(src, pool_tx.clone(), self.dsr)?;
                 Ok(Pending::Staged { rx, frame, single })
             }
-            Backend::Full { sess, rec, rec_dsr } => {
+            Backend::Full { sess, rec, rec_dsr, load } => {
                 let mut src = vec![0f32; n];
                 kernels::fill_src(&frame, &mut src);
                 let src = Tensor::from_array((shape.to_vec(), src))?;
@@ -371,10 +412,12 @@ impl RvmEngine {
                 }
                 let r = rec.as_ref().unwrap();
                 let dsr = Tensor::from_array((vec![1i64], vec![self.dsr]))?;
+                let t0 = Instant::now();
                 let mut out = sess.run(ort::inputs![
                     "src" => &src, "r1i" => &r[0], "r2i" => &r[1], "r3i" => &r[2], "r4i" => &r[3],
                     "downsample_ratio" => &dsr
                 ])?;
+                load.add(0, t0.elapsed());
                 let fgr = take(&mut out, "fgr")?;
                 let pha = take(&mut out, "pha")?;
                 let new_rec = models::REC_OUT.iter().map(|n| take(&mut out, n)).collect::<Result<Vec<_>>>()?;
@@ -448,7 +491,7 @@ mod tests {
         };
         let (pool_tx, pool_rx) = mpsc::channel();
         let mut staged = engine(Backend::Staged { pipe: StagePipeline::new(&stage_paths, [2, 4, 4])?, pool_tx, pool_rx });
-        let mut full = engine(Backend::Full { sess: build_session(&full_path, 4)?, rec: None, rec_dsr: 0.375 });
+        let mut full = engine(Backend::Full { sess: build_session(&full_path, 4)?, rec: None, rec_dsr: 0.375, load: StageLoad::default() });
         let mut seed = 7u32;
         for _ in 0..3 {
             let mut f = Frame::new(w, h);

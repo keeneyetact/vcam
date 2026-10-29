@@ -220,8 +220,22 @@ Per frame, on the CPU:
   ONNX Runtime does it — is one fused Rust pass on the output thread instead;
 - post-processing (single-person isolation, compositing, NV12 conversion) runs
   on the output thread, overlapping the next inference;
-- threads are capped to the fast cores (more threads *slow* this small
-  recurrent net).
+- threads are one per fast physical core, at most 8 per stage: vcam detects
+  the CPU's cores and, on a hybrid CPU (12th-gen Intel and later), uses only
+  the performance cores. Hyperthreads, E-cores and more threads *slow* this
+  small recurrent net.
+
+**Auto edge detail** (the default) fits the quality to each PC. It starts from
+a guess based on the detected fast cores and the capture size. Every 3 s it
+compares the slowest model stage's time with the frame budget at the camera's
+rate. Near the budget (90%), it steps coarser. When the next finer step is
+predicted to fit under 70% (cost grows with the downsample ratio squared), it
+steps finer, up to Fine (0.5). A step that proved too slow isn't retried for
+2 minutes, so the level settles instead of flapping. Because it keeps
+measuring, it also reacts to a busy video-call app, thermal throttling or
+battery saver. The chosen level is shown under Edge detail in Advanced
+settings, and in the CLI log. Picking a fixed preset (or `--downsample`)
+turns Auto off.
 
 Measured on an i7-14700 at 720p / Balanced: the engine sustains ~32–36 fps;
 the output is identical to the stock model to within float rounding (see the

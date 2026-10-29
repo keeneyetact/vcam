@@ -12,9 +12,11 @@
 #[cfg(not(windows))]
 compile_error!("vcam targets Windows (Media Foundation capture + the OBS Virtual Camera)");
 
+pub mod autotune;
 pub mod capture;
 pub mod compositor;
 pub mod faces;
+pub mod hw;
 pub mod imgproc;
 pub mod kernels;
 pub mod look;

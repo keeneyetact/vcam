@@ -20,6 +20,24 @@ self-contained Windows exe, no Python or other runtime needed.
 
 ---
 
+## Download (Windows)
+
+Get the latest build from the
+**[Releases page](https://github.com/keeneyetact/vcam/releases/latest)**:
+
+- **`vcam.exe`**: the app on its own. Download it and double-click.
+- **`vcam-<version>-windows-x64.zip`**: `vcam.exe`, the `vcam-cli.exe`
+  command-line tool and this README.
+
+Both need Windows 10/11 (64-bit). The models are bundled, so no Python,
+installer or internet connection is needed. To feed Meet, Zoom, Teams and
+other apps, install OBS Studio once (see
+[Virtual-camera backend](#virtual-camera-backend-required-to-feed-other-apps)).
+Windows SmartScreen may warn about an unsigned exe: choose
+**More info → Run anyway**.
+
+---
+
 ## 1. Build
 
 Needs [rustup](https://rustup.rs) and, on Windows, the Visual Studio C++ Build

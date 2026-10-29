@@ -22,7 +22,9 @@ use crate::models;
 /// The model's fixed input size.
 const SIZE: usize = 640;
 const STRIDES: [usize; 3] = [8, 16, 32];
-const MIN_SCORE: f32 = 0.6;
+/// Real faces score ~0.9; an open hand held out can score 0.6-0.65, and
+/// taken for someone else's face it got the user's own arm cut away.
+const MIN_SCORE: f32 = 0.8;
 const NMS_IOU: f32 = 0.3;
 /// How often the tracker looks for faces.
 const INTERVAL: Duration = Duration::from_millis(100);

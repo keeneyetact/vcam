@@ -68,9 +68,10 @@ impl Settings {
             speed: s("speed"),
             quality: s("quality"),
             one_person: b("one_person", true),
-            // A new key: the old "fix_exposure" pinned the exposure always
-            // and was mostly left off for the darker picture.
-            keep_frame_rate: b("keep_frame_rate", true),
+            // Off by default. A new key: the old "keep_frame_rate" defaulted
+            // on and was saved that way, and the older "fix_exposure" pinned
+            // the exposure always.
+            keep_frame_rate: b("dim_light_fps", false),
             brightness: m.get("brightness").and_then(Value::as_f64).unwrap_or(0.0),
             library_migrated: b("library_migrated", false),
             advanced_open: b("advanced_open", true),
@@ -98,7 +99,7 @@ impl Settings {
             "speed": self.speed,
             "quality": self.quality,
             "one_person": self.one_person,
-            "keep_frame_rate": self.keep_frame_rate,
+            "dim_light_fps": self.keep_frame_rate,
             "brightness": (self.brightness * 1000.0).round() / 1000.0,
             "library_migrated": self.library_migrated,
             "advanced_open": self.advanced_open,

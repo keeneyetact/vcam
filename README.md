@@ -250,7 +250,7 @@ the camera, and restore the camera's own setting afterwards — on a "Full HD
 webcam" that took 720p from 20 to 30 fps.
 
 The app does this only when it's needed (**Keep full frame rate in dim light**
-in Advanced settings, on by default). The camera keeps its own auto-exposure
+in Advanced settings, off by default). The camera keeps its own auto-exposure
 until the delivered rate drops below 85% of nominal. vcam then fixes the
 exposure and lifts the picture with a gamma curve, solved on its brightness
 histogram, so its mean brightness matches what auto-exposure was giving. Black

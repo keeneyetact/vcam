@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,8 @@ use crate::tray;
 use crate::updates::{self, Update};
 
 const OBS_URL: &str = "https://obsproject.com/download";
+/// `update_progress` before the download's size is known.
+const NO_PROGRESS: u8 = u8::MAX;
 
 /// label, capture (w, h), output (w, h). "Smooth" captures at a fast low-res
 /// the webcam can deliver at 30 fps, then upscales the matted output. The
@@ -503,6 +506,8 @@ pub struct App {
     updates_rx: mpsc::Receiver<Update>,
     /// The update the user asked for is downloading; yields the verified exe.
     update_job: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// Percent of that download done; [`NO_PROGRESS`] until the size is known.
+    update_progress: Arc<AtomicU8>,
     /// The tray icon; closing the window hides it there when present.
     tray: Option<tray::Tray>,
     /// Closing quits for real (tray menu Quit, restart to update).
@@ -611,6 +616,7 @@ impl App {
                 updates::watch(move || repaint.request_repaint())
             },
             update_job: None,
+            update_progress: Arc::new(AtomicU8::new(NO_PROGRESS)),
             tray: main_hwnd(cc).and_then(|h| tray::Tray::new(ctx, h)),
             quitting: false,
             tray_noticed: false,
@@ -1183,8 +1189,27 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("vcam {} is available", up.version)).font(semi(12.5)).color(p.text));
                     if self.update_job.is_some() {
-                        ui.add(egui::Spinner::new().size(12.0).color(p.muted));
-                        ui.label(RichText::new("Downloading; vcam restarts when it's done.").size(12.0).color(p.muted));
+                        match self.update_progress.load(Ordering::Relaxed) {
+                            NO_PROGRESS => {
+                                ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+                                ui.label(
+                                    RichText::new("Downloading; vcam restarts when it's done.").size(12.0).color(p.muted),
+                                );
+                            }
+                            pct => {
+                                ui.add(
+                                    egui::ProgressBar::new(f32::from(pct) / 100.0)
+                                        .desired_width(120.0)
+                                        .desired_height(8.0)
+                                        .fill(p.accent),
+                                );
+                                ui.label(
+                                    RichText::new(format!("Downloading {pct}%; vcam restarts when it's done."))
+                                        .size(12.0)
+                                        .color(p.muted),
+                                );
+                            }
+                        }
                     } else {
                         ui.label(
                             RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).size(12.0).color(p.muted),
@@ -1225,8 +1250,14 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let repaint = ctx.clone();
+        let progress = self.update_progress.clone();
+        progress.store(NO_PROGRESS, Ordering::Relaxed);
         std::thread::spawn(move || {
-            let _ = tx.send(updates::stage(&asset));
+            let staged = updates::stage(&asset, |pct| {
+                progress.store(pct, Ordering::Relaxed);
+                repaint.request_repaint();
+            });
+            let _ = tx.send(staged);
             repaint.request_repaint();
         });
         self.update_job = Some(rx);

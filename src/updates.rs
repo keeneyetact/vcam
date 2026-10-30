@@ -134,15 +134,18 @@ fn check() -> Option<Update> {
 }
 
 /// Downloads `asset` to `vcam.new.exe` beside the running exe and returns its
-/// path, ready for [`install`], once its SHA-256 matches. Blocks.
-pub fn stage(asset: &Download) -> Option<PathBuf> {
+/// path, ready for [`install`], once its SHA-256 matches. Blocks. `progress`
+/// gets the percent done each time it changes (never, if the server doesn't
+/// say how big the file is).
+pub fn stage(asset: &Download, progress: impl Fn(u8)) -> Option<PathBuf> {
     let want = &asset.sha256;
     let dest = sibling("vcam.new.exe");
     if sha256_file(&dest).is_some_and(|h| h == *want) {
+        progress(100);
         return Some(dest); // already downloaded on an earlier try
     }
     let part = sibling("vcam.new.exe.part");
-    let got = download(&asset.url, &part);
+    let got = download(&asset.url, &part, progress);
     if got.as_deref() != Some(want.as_str()) {
         let _ = fs::remove_file(&part);
         return None;
@@ -152,15 +155,17 @@ pub fn stage(asset: &Download) -> Option<PathBuf> {
 }
 
 /// Streams `url` into `path`, returning the file's SHA-256 (hex).
-fn download(url: &str, path: &Path) -> Option<String> {
+fn download(url: &str, path: &Path, progress: impl Fn(u8)) -> Option<String> {
     let resp = ureq::get(url)
         .header("User-Agent", concat!("vcam/", env!("CARGO_PKG_VERSION")))
         .call()
         .ok()?;
+    let total = resp.body().content_length().filter(|&n| n > 0);
     let mut reader = resp.into_body().into_reader();
     let mut file = File::create(path).ok()?;
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let (mut done, mut told) = (0u64, None);
     loop {
         let n = reader.read(&mut buf).ok()?;
         if n == 0 {
@@ -168,6 +173,14 @@ fn download(url: &str, path: &Path) -> Option<String> {
         }
         hash.update(&buf[..n]);
         file.write_all(&buf[..n]).ok()?;
+        done += n as u64;
+        if let Some(total) = total {
+            let pct = (done.min(total) * 100 / total) as u8;
+            if told != Some(pct) {
+                told = Some(pct);
+                progress(pct);
+            }
+        }
     }
     file.sync_all().ok()?;
     Some(hex(&hash.finalize()))

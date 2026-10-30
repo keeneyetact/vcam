@@ -28,7 +28,8 @@ pub struct Settings {
     pub blur_image: bool,
     pub blur_strength: Option<f64>,
     pub realistic: bool,
-    /// Outline the camera picture in the output (picture background).
+    /// Outline the camera picture in the app's preview only, never in the
+    /// virtual camera (picture background).
     pub outline: bool,
     pub speed: String,
     pub quality: String,

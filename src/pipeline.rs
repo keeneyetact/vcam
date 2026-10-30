@@ -66,10 +66,7 @@ impl OutputPipeline {
                     if let Some(a) = alpha {
                         imgproc::FLOATS.give(a);
                     }
-                    if let Some(r) = job.outline {
-                        let t = (out.h / 180).max(2);
-                        imgproc::draw_outline(Arc::make_mut(&mut out), r, t, [0, 0, 255]);
-                    }
+                    let rendered = out.size();
                     if let Some((w, h)) = job.upscale.filter(|&s| s != out.size()) {
                         // Cover-fit: crops rather than stretches if the camera
                         // couldn't deliver the output's aspect ratio.
@@ -82,7 +79,17 @@ impl OutputPipeline {
                     }
                     *l.lock().unwrap() = Some(out.clone());
                     if let Some(cb) = &on_output {
-                        cb(&out);
+                        // The outline is for the app's own preview only: the
+                        // call gets the clean picture.
+                        match job.outline {
+                            Some(r) => {
+                                let mut shown = (*out).clone();
+                                let t = (shown.h / 180).max(2);
+                                imgproc::draw_outline(&mut shown, cover_rect(r, rendered, out.size()), t, [0, 0, 255]);
+                                cb(&Arc::new(shown));
+                            }
+                            None => cb(&out),
+                        }
                     }
                     Ok(())
                 });
@@ -117,6 +124,20 @@ impl OutputPipeline {
     pub fn latest(&self) -> Option<Arc<Frame>> {
         self.latest.lock().unwrap().clone()
     }
+}
+
+/// `r` in a `from`-sized frame, carried through `resize_cover` to `to`.
+fn cover_rect([x, y, w, h]: [usize; 4], from: (usize, usize), to: (usize, usize)) -> [usize; 4] {
+    if from == to {
+        return [x, y, w, h];
+    }
+    let s = (to.0 as f64 / from.0 as f64).max(to.1 as f64 / from.1 as f64);
+    let nw = ((from.0 as f64 * s).round() as usize).max(to.0);
+    let nh = ((from.1 as f64 * s).round() as usize).max(to.1);
+    let (x0, y0) = (((nw - to.0) / 2) as f64, ((nh - to.1) / 2) as f64);
+    let (ax, ay) = ((x as f64 * s - x0).max(0.0), (y as f64 * s - y0).max(0.0));
+    let (bx, by) = (((x + w) as f64 * s - x0).max(0.0), ((y + h) as f64 * s - y0).max(0.0));
+    [ax.round() as usize, ay.round() as usize, (bx - ax).round() as usize, (by - ay).round() as usize]
 }
 
 impl Drop for OutputPipeline {

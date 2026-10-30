@@ -1,15 +1,15 @@
 //! Keeps vcam up to date from GitHub Releases.
 //!
 //! A background thread asks GitHub for the latest release at startup and then
-//! every few hours while the app stays open. When there is a newer one it
-//! downloads its `vcam.exe` next to the running exe as `vcam.new.exe`, checks
-//! it against the SHA-256 GitHub publishes for it, and hands the update to the
-//! UI. The UI swaps it in when the user restarts or quits: Windows won't let a
-//! running exe be overwritten but will let it be renamed, so the old exe moves
-//! aside to `vcam.old.exe` (deleted on the next start) and the new one takes
-//! its name. If the download can't be done or checked (offline, a read-only
-//! folder, no checksum) the UI falls back to linking the release page.
-//! Failures are silent.
+//! every few hours while the app stays open, and tells the UI when there is a
+//! newer one. Nothing is downloaded until the user asks for the update: then
+//! [`stage`] downloads its `vcam.exe` next to the running exe as
+//! `vcam.new.exe` and checks it against the SHA-256 GitHub publishes for it,
+//! and [`install`] swaps it in. Windows won't let a running exe be overwritten
+//! but will let it be renamed, so the old exe moves aside to `vcam.old.exe`
+//! (deleted on the next start) and the new one takes its name. If the update
+//! can't be downloaded or checked (offline, a read-only folder, no checksum)
+//! the UI falls back to linking the release page. Failures are silent.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -30,9 +30,16 @@ pub struct Update {
     pub version: String,
     /// The release page, where the exe and zip are.
     pub url: String,
-    /// The verified new exe, ready for [`install`]; `None` means the user has
-    /// to download it from `url`.
-    pub staged: Option<PathBuf>,
+    /// The exe to fetch with [`stage`]; `None` means the user has to download
+    /// it from `url`.
+    pub asset: Option<Download>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Download {
+    url: String,
+    /// Lowercase hex SHA-256.
+    sha256: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -57,21 +64,19 @@ pub fn watch(on_found: impl Fn() + Send + 'static) -> mpsc::Receiver<Update> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         remove_leftover(&sibling("vcam.old.exe"));
-        let mut told: Option<(String, bool)> = None;
+        let mut told: Option<String> = None;
         loop {
             match check() {
-                Some((mut up, asset)) => {
-                    up.staged = asset.and_then(|a| stage(&a));
-                    let key = (up.version.clone(), up.staged.is_some());
-                    if told.as_ref() != Some(&key) {
-                        told = Some(key);
+                Some(up) => {
+                    if told.as_ref() != Some(&up.version) {
+                        told = Some(up.version.clone());
                         if tx.send(up).is_err() {
                             return; // the window closed
                         }
                         on_found();
                     }
                 }
-                // Up to date: a downloaded exe from an earlier run is stale.
+                // Up to date: an exe downloaded by an earlier run is stale.
                 None => {
                     let _ = fs::remove_file(sibling("vcam.new.exe"));
                 }
@@ -99,7 +104,7 @@ pub fn install(staged: &Path, relaunch: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn check() -> Option<(Update, Option<Asset>)> {
+fn check() -> Option<Update> {
     let body = ureq::get(LATEST_URL)
         .header("User-Agent", concat!("vcam/", env!("CARGO_PKG_VERSION")))
         .header("Accept", "application/vnd.github+json")
@@ -113,24 +118,30 @@ fn check() -> Option<(Update, Option<Asset>)> {
     if !is_newer(&version, env!("CARGO_PKG_VERSION")) {
         return None;
     }
-    let asset = rel.assets.into_iter().find(|a| a.name.eq_ignore_ascii_case(ASSET));
-    Some((Update { version, url: rel.html_url, staged: None }, asset))
+    // Debug builds never offer it (a `cargo run` shouldn't replace itself
+    // with the release).
+    let asset = rel
+        .assets
+        .into_iter()
+        .filter(|_| !cfg!(debug_assertions))
+        .find(|a| a.name.eq_ignore_ascii_case(ASSET))
+        .and_then(|a| {
+            let sha256 = a.digest?.strip_prefix("sha256:")?.to_ascii_lowercase();
+            Some(Download { url: a.browser_download_url, sha256 })
+        });
+    Some(Update { version, url: rel.html_url, asset })
 }
 
 /// Downloads `asset` to `vcam.new.exe` beside the running exe and returns its
-/// path once its SHA-256 matches. Debug builds never stage (a `cargo run`
-/// shouldn't replace itself with the release).
-fn stage(asset: &Asset) -> Option<PathBuf> {
-    if cfg!(debug_assertions) {
-        return None;
-    }
-    let want = asset.digest.as_deref()?.strip_prefix("sha256:")?.to_ascii_lowercase();
+/// path, ready for [`install`], once its SHA-256 matches. Blocks.
+pub fn stage(asset: &Download) -> Option<PathBuf> {
+    let want = &asset.sha256;
     let dest = sibling("vcam.new.exe");
-    if sha256_file(&dest).is_some_and(|h| h == want) {
-        return Some(dest); // already downloaded on an earlier run
+    if sha256_file(&dest).is_some_and(|h| h == *want) {
+        return Some(dest); // already downloaded on an earlier try
     }
     let part = sibling("vcam.new.exe.part");
-    let got = download(&asset.browser_download_url, &part);
+    let got = download(&asset.url, &part);
     if got.as_deref() != Some(want.as_str()) {
         let _ = fs::remove_file(&part);
         return None;

@@ -496,12 +496,13 @@ pub struct App {
     logo: Option<TextureHandle>,
     save_at: Option<Instant>,
     was_focused: bool,
-    /// A newer release to tell the user about (and install on quit, if it
-    /// was downloaded).
+    /// A newer release to tell the user about.
     update: Option<Update>,
     /// The user closed the update notice.
     update_hidden: bool,
     updates_rx: mpsc::Receiver<Update>,
+    /// The update the user asked for is downloading; yields the verified exe.
+    update_job: Option<mpsc::Receiver<Option<PathBuf>>>,
     /// The tray icon; closing the window hides it there when present.
     tray: Option<tray::Tray>,
     /// Closing quits for real (tray menu Quit, restart to update).
@@ -609,6 +610,7 @@ impl App {
                 let repaint = ctx.clone();
                 updates::watch(move || repaint.request_repaint())
             },
+            update_job: None,
             tray: main_hwnd(cc).and_then(|h| tray::Tray::new(ctx, h)),
             quitting: false,
             tray_noticed: false,
@@ -931,6 +933,19 @@ impl App {
             self.update = Some(up);
             self.update_hidden = false;
         }
+        if let Some(rx) = &self.update_job {
+            match rx.try_recv() {
+                Ok(staged) => {
+                    self.update_job = None;
+                    self.finish_update(ctx, staged);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.update_job = None;
+                    self.finish_update(ctx, None);
+                }
+            }
+        }
 
         if let Some((_, rx)) = &self.vc_job {
             if let Ok((ok, msg)) = rx.try_recv() {
@@ -993,10 +1008,6 @@ impl App {
                 self.tray = None; // removes the icon
                 self.save_settings();
                 self.worker.stop();
-                // A downloaded update installs on quit if not restarted into.
-                if let Some(staged) = self.update.as_ref().and_then(|u| u.staged.clone()) {
-                    let _ = updates::install(&staged, false);
-                }
             }
         }
         if self.save_at.is_some_and(|t| Instant::now() >= t) {
@@ -1161,7 +1172,7 @@ impl App {
         let Some(up) = &self.update else { return };
         let p = self.pal();
         let mut dismiss = false;
-        let mut restart = false;
+        let mut start = false;
         egui::Frame::new()
             .fill(p.notice)
             .stroke(Stroke::new(1.0, p.notice_border))
@@ -1171,14 +1182,18 @@ impl App {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("vcam {} is available", up.version)).font(semi(12.5)).color(p.text));
-                    if up.staged.is_some() {
-                        ui.label(RichText::new("Downloaded; installs when you quit.").size(12.0).color(p.muted));
-                        restart = Self::link(ui, p, "Restart now").clicked();
+                    if self.update_job.is_some() {
+                        ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+                        ui.label(RichText::new("Downloading; vcam restarts when it's done.").size(12.0).color(p.muted));
                     } else {
                         ui.label(
                             RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).size(12.0).color(p.muted),
                         );
-                        if Self::link(ui, p, "Download").on_hover_text(&up.url).clicked() {
+                        if up.asset.is_some() {
+                            start = Self::link(ui, p, "Update now")
+                                .on_hover_text("Download the new version, then restart vcam into it")
+                                .clicked();
+                        } else if Self::link(ui, p, "Download").on_hover_text(&up.url).clicked() {
                             system::open_url(&up.url);
                         }
                     }
@@ -1191,20 +1206,43 @@ impl App {
         if dismiss {
             self.update_hidden = true;
         }
-        if restart {
-            self.restart_to_update(ui.ctx());
+        if start {
+            self.start_update(ui.ctx());
         }
     }
 
-    /// Stops the camera, swaps in the downloaded exe and relaunches it. On
-    /// failure the notice falls back to the Download link.
-    fn restart_to_update(&mut self, ctx: &egui::Context) {
-        let Some(staged) = self.update.as_ref().and_then(|u| u.staged.clone()) else { return };
+    /// The user agreed to update: downloads the new exe in the background,
+    /// then [`Self::finish_update`] installs it.
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let Some(asset) = self.update.as_ref().and_then(|u| u.asset.clone()) else { return };
         if self.worker.running()
-            && !confirm("Update vcam", "Your virtual camera is on. It will turn off while vcam restarts. Restart now?")
+            && !confirm(
+                "Update vcam",
+                "Your virtual camera is on. It will turn off while vcam restarts after the download. Update now?",
+            )
         {
             return;
         }
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(updates::stage(&asset));
+            repaint.request_repaint();
+        });
+        self.update_job = Some(rx);
+    }
+
+    /// Stops the camera, swaps in the downloaded exe and relaunches it. On
+    /// failure (or `None`: the download failed) the notice falls back to the
+    /// Download link.
+    fn finish_update(&mut self, ctx: &egui::Context, staged: Option<PathBuf>) {
+        let Some(staged) = staged else {
+            if let Some(up) = &mut self.update {
+                up.asset = None;
+            }
+            self.update_hidden = false;
+            return;
+        };
         self.save_settings();
         self.worker.stop();
         match updates::install(&staged, true) {
@@ -1215,8 +1253,9 @@ impl App {
             }
             Err(_) => {
                 if let Some(up) = &mut self.update {
-                    up.staged = None;
+                    up.asset = None;
                 }
+                self.update_hidden = false;
             }
         }
     }

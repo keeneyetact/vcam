@@ -98,6 +98,7 @@ pub fn install(staged: &Path, relaunch: bool) -> io::Result<()> {
         let _ = fs::rename(&old, &exe);
         return Err(e);
     }
+    refresh_shell_icon(&exe);
     if relaunch {
         Command::new(&exe).spawn()?;
     }
@@ -184,6 +185,15 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A file next to the running exe.
+/// Tells Explorer the exe at `path` changed, so the taskbar re-reads its icon
+/// instead of keeping one it cached while the file was missing mid-swap.
+fn refresh_shell_icon(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEITEM, SHCNF_PATHW};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe { SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(wide.as_ptr().cast()), None) };
+}
+
 fn sibling(name: &str) -> PathBuf {
     vcam::paths::exe_dir().join(name)
 }

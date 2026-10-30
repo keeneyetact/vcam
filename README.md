@@ -36,6 +36,13 @@ other apps, install OBS Studio once (see
 Windows SmartScreen may warn about an unsigned exe: choose
 **More info → Run anyway**.
 
+vcam updates itself: when a new release is out it downloads the new
+`vcam.exe` in the background, checks it against the SHA-256 GitHub publishes,
+and installs it when you click **Restart now** or next quit the app. It never
+restarts on its own, so a call is never cut off. If vcam sits in a folder it
+can't write to (such as `Program Files`), it shows a **Download** link
+instead. `vcam-cli.exe` isn't updated this way; get it from the zip.
+
 ---
 
 ## 1. Build

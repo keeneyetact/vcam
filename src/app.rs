@@ -486,8 +486,11 @@ pub struct App {
     logo: Option<TextureHandle>,
     save_at: Option<Instant>,
     was_focused: bool,
-    /// A newer release to tell the user about (cleared when dismissed).
+    /// A newer release to tell the user about (and install on quit, if it
+    /// was downloaded).
     update: Option<Update>,
+    /// The user closed the update notice.
+    update_hidden: bool,
     updates_rx: mpsc::Receiver<Update>,
 }
 
@@ -585,6 +588,7 @@ impl App {
             save_at: None,
             was_focused: true,
             update: None,
+            update_hidden: false,
             updates_rx: {
                 let repaint = ctx.clone();
                 updates::watch(move || repaint.request_repaint())
@@ -906,6 +910,7 @@ impl App {
                 egui::UserAttentionType::Informational,
             ));
             self.update = Some(up);
+            self.update_hidden = false;
         }
 
         if let Some((_, rx)) = &self.vc_job {
@@ -953,6 +958,10 @@ impl App {
             } else {
                 self.save_settings();
                 self.worker.stop();
+                // A downloaded update installs on quit if not restarted into.
+                if let Some(staged) = self.update.as_ref().and_then(|u| u.staged.clone()) {
+                    let _ = updates::install(&staged, false);
+                }
             }
         }
         if self.save_at.is_some_and(|t| Instant::now() >= t) {
@@ -1111,9 +1120,13 @@ impl App {
 
     /// "A new version is available" strip above the preview.
     fn ui_update_notice(&mut self, ui: &mut egui::Ui) {
+        if self.update_hidden {
+            return;
+        }
         let Some(up) = &self.update else { return };
         let p = self.pal();
         let mut dismiss = false;
+        let mut restart = false;
         egui::Frame::new()
             .fill(p.notice)
             .stroke(Stroke::new(1.0, p.notice_border))
@@ -1123,11 +1136,16 @@ impl App {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("vcam {} is available", up.version)).font(semi(12.5)).color(p.text));
-                    ui.label(
-                        RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).size(12.0).color(p.muted),
-                    );
-                    if Self::link(ui, p, "Download").on_hover_text(&up.url).clicked() {
-                        system::open_url(&up.url);
+                    if up.staged.is_some() {
+                        ui.label(RichText::new("Downloaded; installs when you quit.").size(12.0).color(p.muted));
+                        restart = Self::link(ui, p, "Restart now").clicked();
+                    } else {
+                        ui.label(
+                            RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).size(12.0).color(p.muted),
+                        );
+                        if Self::link(ui, p, "Download").on_hover_text(&up.url).clicked() {
+                            system::open_url(&up.url);
+                        }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         dismiss = Self::link(ui, p, "✕").on_hover_text("Dismiss").clicked();
@@ -1136,7 +1154,34 @@ impl App {
             });
         ui.add_space(8.0);
         if dismiss {
-            self.update = None;
+            self.update_hidden = true;
+        }
+        if restart {
+            self.restart_to_update(ui.ctx());
+        }
+    }
+
+    /// Stops the camera, swaps in the downloaded exe and relaunches it. On
+    /// failure the notice falls back to the Download link.
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        let Some(staged) = self.update.as_ref().and_then(|u| u.staged.clone()) else { return };
+        if self.worker.running()
+            && !confirm("Update vcam", "Your virtual camera is on. It will turn off while vcam restarts. Restart now?")
+        {
+            return;
+        }
+        self.save_settings();
+        self.worker.stop();
+        match updates::install(&staged, true) {
+            Ok(()) => {
+                self.update = None; // installed; nothing left for quit to do
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(_) => {
+                if let Some(up) = &mut self.update {
+                    up.staged = None;
+                }
+            }
         }
     }
 

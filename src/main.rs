@@ -8,6 +8,7 @@
 mod app;
 mod library;
 mod settings;
+mod tray;
 mod updates;
 
 use std::path::PathBuf;

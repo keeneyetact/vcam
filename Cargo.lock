@@ -3143,6 +3143,7 @@ dependencies = [
  "image",
  "minifb",
  "ort",
+ "raw-window-handle",
  "rayon",
  "rfd",
  "serde",

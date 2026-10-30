@@ -25,6 +25,7 @@ use vcam::{capture, imgproc, paths, system, virtualcam, Frame};
 
 use crate::library::{self, ThumbCache};
 use crate::settings::Settings;
+use crate::tray;
 use crate::updates::{self, Update};
 
 const OBS_URL: &str = "https://obsproject.com/download";
@@ -198,6 +199,15 @@ pub fn friendly_error(raw: &str) -> String {
             .into()
     } else {
         format!("Something went wrong: {raw}")
+    }
+}
+
+/// The egui window's handle, for the tray icon to show and hide it.
+fn main_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
     }
 }
 
@@ -492,6 +502,12 @@ pub struct App {
     /// The user closed the update notice.
     update_hidden: bool,
     updates_rx: mpsc::Receiver<Update>,
+    /// The tray icon; closing the window hides it there when present.
+    tray: Option<tray::Tray>,
+    /// Closing quits for real (tray menu Quit, restart to update).
+    quitting: bool,
+    /// The "still running in the tray" notice was shown this run.
+    tray_noticed: bool,
 }
 
 impl App {
@@ -593,6 +609,9 @@ impl App {
                 let repaint = ctx.clone();
                 updates::watch(move || repaint.request_repaint())
             },
+            tray: main_hwnd(cc).and_then(|h| tray::Tray::new(ctx, h)),
+            quitting: false,
+            tray_noticed: false,
         };
         app.render_thumbs(ctx);
         app.render_gallery(ctx);
@@ -952,10 +971,26 @@ impl App {
         }
         self.was_focused = focused;
 
+        if let Some(tray::Event::Quit) = self.tray.as_ref().and_then(|t| t.events.try_recv().ok()) {
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.worker.running() && !confirm("Quit vcam", "Your virtual camera is on. Quit and turn it off?") {
+            if let Some(tray) = self.tray.as_ref().filter(|_| !self.quitting) {
+                // The window's X hides vcam to the tray; the tray menu quits.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                tray.hide_window();
+                if !self.tray_noticed {
+                    self.tray_noticed = true;
+                    tray.notify("vcam is still running", "Click the tray icon to open it, or right-click it to quit.");
+                }
+                self.worker.set_preview_box(None); // nobody sees it while hidden
+                self.save_settings();
+            } else if self.worker.running() && !confirm("Quit vcam", "Your virtual camera is on. Quit and turn it off?") {
+                self.quitting = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             } else {
+                self.tray = None; // removes the icon
                 self.save_settings();
                 self.worker.stop();
                 // A downloaded update installs on quit if not restarted into.
@@ -1175,6 +1210,7 @@ impl App {
         match updates::install(&staged, true) {
             Ok(()) => {
                 self.update = None; // installed; nothing left for quit to do
+                self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(_) => {

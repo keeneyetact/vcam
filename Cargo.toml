@@ -23,6 +23,7 @@ minifb = "0.29"
 # ONNX Runtime, CPU build, linked statically (no DLL next to the exe).
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-24"] }
 rayon = "1.10"
+raw-window-handle = "0.6"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,6 +40,7 @@ features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",

@@ -36,9 +36,13 @@ other apps, install OBS Studio once (see
 Windows SmartScreen may warn about an unsigned exe: choose
 **More info → Run anyway**.
 
+Closing the window doesn't quit vcam: it keeps running (and the virtual
+camera stays on) with an icon in the notification area. Click the icon to
+open the window again, or right-click it and choose **Quit**.
+
 vcam updates itself: when a new release is out it downloads the new
 `vcam.exe` in the background, checks it against the SHA-256 GitHub publishes,
-and installs it when you click **Restart now** or next quit the app. It never
+and installs it when you click **Restart now** or next quit the app (from the tray icon). It never
 restarts on its own, so a call is never cut off. If vcam sits in a folder it
 can't write to (such as `Program Files`), it shows a **Download** link
 instead. `vcam-cli.exe` isn't updated this way; get it from the zip.

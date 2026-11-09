@@ -182,7 +182,9 @@ fn semi(size: f32) -> FontId {
 /// Turn a worker error into a plain-language next step.
 pub fn friendly_error(raw: &str) -> String {
     let m = raw.to_lowercase();
-    if m.contains("could not open camera") {
+    // 0xC00D3704 (MF_E_HW_MFT_FAILED_START_STREAMING): another app is
+    // streaming from the webcam.
+    if m.contains("could not open camera") || m.contains("0xc00d3704") {
         "Can't access your webcam. Close other apps that might be using it (Meet, Zoom, Teams, OBS), \
          or pick a different camera, then try again."
             .into()

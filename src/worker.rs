@@ -145,6 +145,10 @@ const WATCH_EVERY: Duration = Duration::from_millis(100);
 /// Repeat the last frame after this long without one (well under the ~330 ms
 /// an app tolerates).
 const KEEP_FED_GAP: Duration = Duration::from_millis(100);
+/// How long a webcam that fails while an app wants the output is retried, and
+/// how often (see `retry_webcam`).
+const WEBCAM_RETRY_FOR: Duration = Duration::from_secs(10);
+const WEBCAM_RETRY_EVERY: Duration = Duration::from_millis(500);
 
 type SourceKey = (PathBuf, Option<SystemTime>);
 type BgKey = (SourceKey, usize, usize, Framing);
@@ -609,11 +613,15 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         info.status = Status::Running;
     }
 
-    // The webcam; None while paused (no app is using the virtual camera).
+    // The webcam; None while paused (no app is using the virtual camera) or
+    // while it's being retried.
     let mut grabber = Some(grabber);
+    let mut paused = false;
     // When the output was last wanted. Starting counts: the webcam runs for
     // LINGER first, which also shows it works.
     let mut wanted_at = Instant::now();
+    // Since when the webcam has been failing, and when to try it next.
+    let (mut failing_since, mut next_try) = (None::<Instant>, Instant::now());
     let (mut frames, mut since, mut last_seq) = (0u64, Instant::now(), 0u64);
     // The picture's curve (exposure lift + brightness), rebuilt only when
     // either changes.
@@ -633,7 +641,10 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
                 wanted_at = Instant::now();
             }
             if wanted_at.elapsed() >= LINGER {
-                if grabber.take().is_some() {
+                if !paused {
+                    paused = true;
+                    grabber = None;
+                    failing_since = None;
                     crate::log!("No app is using the virtual camera: paused (webcam off)");
                     let mut info = sh.info.lock().unwrap();
                     info.waiting = true;
@@ -642,14 +653,27 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
                 std::thread::sleep(WATCH_EVERY);
                 continue;
             }
-            if grabber.is_none() {
+            if paused {
+                paused = false;
                 crate::log!("An app opened the virtual camera: resuming");
                 // Black, not the picture from when it paused, until the
                 // first new frame (the keep-alive repeats it meanwhile).
                 cam.as_ref().unwrap().lock().unwrap().blank();
                 *sh.latest.lock().unwrap() = (None, None);
                 sh.info.lock().unwrap().waiting = false;
-                let (g, info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure)?;
+            }
+            if grabber.is_none() {
+                if Instant::now() < next_try {
+                    std::thread::sleep(WATCH_EVERY);
+                    continue;
+                }
+                let (g, info) = match FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        retry_webcam(e, &mut failing_since, &mut next_try)?;
+                        continue;
+                    }
+                };
                 if (info.width, info.height) != (w, h) {
                     // The engine and background are built for the old size.
                     crate::log!("The webcam came back at {}x{} (was {w}x{h}): rebuilding", info.width, info.height);
@@ -666,14 +690,21 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
                 auto = None;
             }
         }
-        let Some(grabber) = grabber.as_ref() else { continue };
-        let Some((seq, frame, lift)) = grabber.wait_next(last_seq, Duration::from_millis(100)) else {
-            if !grabber.running() {
-                anyhow::bail!("camera stopped delivering frames");
+        let Some(g) = grabber.as_ref() else { continue };
+        let Some((seq, frame, lift)) = g.wait_next(last_seq, Duration::from_millis(100)) else {
+            if !g.running() {
+                let why = g.error().map(|e| format!(": {e}")).unwrap_or_default();
+                let e = anyhow::anyhow!("camera stopped delivering frames{why}");
+                if watcher.is_none() {
+                    return Err(e);
+                }
+                grabber = None;
+                retry_webcam(e, &mut failing_since, &mut next_try)?;
             }
             continue;
         };
         last_seq = seq;
+        failing_since = None; // the webcam works
         let (load, mirror, bright, want_dsr, multi, cam_framing, outline) = {
             let mut bg = sh.bg.lock().unwrap();
             let cfg = sh.cfg.lock().unwrap();
@@ -711,7 +742,7 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         }
         // The dim-light brightening measures the cropped part.
         if measured != Some(cam_framing) {
-            grabber.set_region(cam_framing.effective_crop(w, h, cam_framing.target_aspect(w as f32 / h as f32)));
+            g.set_region(cam_framing.effective_crop(w, h, cam_framing.target_aspect(w as f32 / h as f32)));
             measured = Some(cam_framing);
         }
         // Where the camera picture lands, mirrored with it, for the outline.
@@ -778,6 +809,22 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
     drop(cam);
     drop(engine);
     drop(grabber);
+    Ok(())
+}
+
+/// The webcam failed while an app wants the output. Often that app is still
+/// letting it go: e.g. Zoom switching from the webcam to this camera opens
+/// this one before it has released the webcam. So retry for a while, showing
+/// black, and give up (with `e`) only if it stays unavailable.
+fn retry_webcam(e: anyhow::Error, failing_since: &mut Option<Instant>, next_try: &mut Instant) -> Result<()> {
+    let since = *failing_since.get_or_insert_with(|| {
+        crate::log!("Webcam not available yet ({e:#}); retrying for up to {} s", WEBCAM_RETRY_FOR.as_secs());
+        Instant::now()
+    });
+    if since.elapsed() >= WEBCAM_RETRY_FOR {
+        return Err(e);
+    }
+    *next_try = Instant::now() + WEBCAM_RETRY_EVERY;
     Ok(())
 }
 

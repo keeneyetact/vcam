@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -136,6 +136,16 @@ pub struct Preview {
     pub rgb: Vec<u8>,
 }
 
+/// How long the webcam keeps running after the last app closes the virtual
+/// camera (and after Start, if no app has it open by then). Then it pauses:
+/// webcam off, nothing computed, until an app opens the camera again.
+const LINGER: Duration = Duration::from_millis(2500);
+/// While paused: how often to look for an app opening the virtual camera.
+const WATCH_EVERY: Duration = Duration::from_millis(100);
+/// Repeat the last frame after this long without one (well under the ~330 ms
+/// an app tolerates).
+const KEEP_FED_GAP: Duration = Duration::from_millis(100);
+
 type SourceKey = (PathBuf, Option<SystemTime>);
 type BgKey = (SourceKey, usize, usize, Framing);
 
@@ -170,6 +180,9 @@ struct Info {
     quality: Option<f32>,
     device: Option<String>,
     camera: Option<CameraInfo>,
+    /// Running, but paused (webcam closed, nothing computed) until an app
+    /// opens the virtual camera.
+    waiting: bool,
 }
 
 struct Shared {
@@ -205,7 +218,16 @@ impl VCamWorker {
         let shared = Shared {
             cfg: Mutex::new(cfg),
             bg: Mutex::new(BgState::default()),
-            info: Mutex::new(Info { status: Status::Stopped, running: false, error: None, fps: 0.0, quality: None, device: None, camera: None }),
+            info: Mutex::new(Info {
+                status: Status::Stopped,
+                running: false,
+                error: None,
+                fps: 0.0,
+                quality: None,
+                device: None,
+                camera: None,
+                waiting: false,
+            }),
             stop: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             preview_box: Mutex::new(None),
@@ -303,6 +325,12 @@ impl VCamWorker {
         self.shared.info.lock().unwrap().device.clone()
     }
 
+    /// Running but paused until an app (Meet, Zoom, Teams...) opens the
+    /// virtual camera: the webcam is off and nothing is computed.
+    pub fn waiting(&self) -> bool {
+        self.shared.info.lock().unwrap().waiting
+    }
+
     pub fn camera_info(&self) -> Option<CameraInfo> {
         self.shared.info.lock().unwrap().camera.clone()
     }
@@ -397,6 +425,7 @@ fn thread_main(sh: &Arc<Shared>) {
     info.quality = None;
     info.device = None;
     info.camera = None;
+    info.waiting = false;
     drop(info);
     *sh.latest.lock().unwrap() = (None, None);
     *sh.latest_raw.lock().unwrap() = None;
@@ -525,7 +554,7 @@ fn make_engine(cfg: &Config, w: usize, h: usize) -> Result<RvmEngine> {
 fn run_session(sh: &Arc<Shared>) -> Result<()> {
     let cfg = sh.cfg.lock().unwrap().clone();
     let (grabber, cam_info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure)?;
-    let (w, h, cam_fps) = (cam_info.width, cam_info.height, cam_info.fps);
+    let (w, h, mut cam_fps) = (cam_info.width, cam_info.height, cam_info.fps);
     crate::log!("Capturing {w}x{h} {} @ {:.0} fps from '{}'", cam_info.format, cam_info.fps, cam_info.name);
     if let Some(e) = cam_info.exposure {
         crate::log!("Exposure fixed at 1/{} s to hold the frame rate", 1u32 << -e.min(0));
@@ -565,8 +594,13 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         crate::log!("Virtual camera live -> '{}' (select it in your video app)", c.device());
     }
     let device = cam.as_ref().map(|c| c.device().to_string());
+    let cam = cam.map(|c| Arc::new(Mutex::new(c)));
+    // Who has the virtual camera open. None (no virtual camera: preview only)
+    // == always running.
+    let watcher = cam.as_ref().map(|c| c.lock().unwrap().watcher());
+    let keep_fed = cam.clone().map(KeepFed::start);
     let sh2 = sh.clone();
-    let pipeline = OutputPipeline::new(cam, Some(Box::new(move |out: &Arc<Frame>| store_latest(&sh2, out))))?;
+    let pipeline = OutputPipeline::new(cam.clone(), Some(Box::new(move |out: &Arc<Frame>| store_latest(&sh2, out))))?;
     {
         let mut info = sh.info.lock().unwrap();
         info.device = device;
@@ -575,6 +609,11 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         info.status = Status::Running;
     }
 
+    // The webcam; None while paused (no app is using the virtual camera).
+    let mut grabber = Some(grabber);
+    // When the output was last wanted. Starting counts: the webcam runs for
+    // LINGER first, which also shows it works.
+    let mut wanted_at = Instant::now();
     let (mut frames, mut since, mut last_seq) = (0u64, Instant::now(), 0u64);
     // The picture's curve (exposure lift + brightness), rebuilt only when
     // either changes.
@@ -587,6 +626,47 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         if let Some(e) = pipeline.error() {
             anyhow::bail!(e);
         }
+        if let Some(watch) = watcher {
+            // An app streaming from the virtual camera wants the output; so
+            // does the camera crop editor, which shows the live picture.
+            if watch.consumers() > 0 || sh.want_raw.load(Ordering::Relaxed) {
+                wanted_at = Instant::now();
+            }
+            if wanted_at.elapsed() >= LINGER {
+                if grabber.take().is_some() {
+                    crate::log!("No app is using the virtual camera: paused (webcam off)");
+                    let mut info = sh.info.lock().unwrap();
+                    info.waiting = true;
+                    info.fps = 0.0;
+                }
+                std::thread::sleep(WATCH_EVERY);
+                continue;
+            }
+            if grabber.is_none() {
+                crate::log!("An app opened the virtual camera: resuming");
+                // Black, not the picture from when it paused, until the
+                // first new frame (the keep-alive repeats it meanwhile).
+                cam.as_ref().unwrap().lock().unwrap().blank();
+                *sh.latest.lock().unwrap() = (None, None);
+                sh.info.lock().unwrap().waiting = false;
+                let (g, info) = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps as f64, cfg.exposure)?;
+                if (info.width, info.height) != (w, h) {
+                    // The engine and background are built for the old size.
+                    crate::log!("The webcam came back at {}x{} (was {w}x{h}): rebuilding", info.width, info.height);
+                    sh.restart.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                cam_fps = info.fps;
+                sh.info.lock().unwrap().camera = Some(info);
+                grabber = Some(g);
+                // A fresh webcam: its frames count from 0, and its exposure
+                // and the speed measurements start over.
+                (frames, since, last_seq) = (0, Instant::now(), 0);
+                measured = None;
+                auto = None;
+            }
+        }
+        let Some(grabber) = grabber.as_ref() else { continue };
         let Some((seq, frame, lift)) = grabber.wait_next(last_seq, Duration::from_millis(100)) else {
             if !grabber.running() {
                 anyhow::bail!("camera stopped delivering frames");
@@ -691,9 +771,47 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
             since = Instant::now();
         }
     }
-    // Drop order: pipeline (drains, then closes the virtual camera), engine, camera.
+    // Drop order: keep-alive, pipeline (drains), the virtual camera (closes
+    // with the last of them), engine, webcam.
+    drop(keep_fed);
     drop(pipeline);
+    drop(cam);
     drop(engine);
     drop(grabber);
     Ok(())
+}
+
+/// While an app is watching but nothing new goes out (paused, or the webcam
+/// still starting), repeats the last frame so the app holds the camera open
+/// steadily instead of dropping and reopening it (see `VirtualCam::keep_fed`).
+struct KeepFed {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl KeepFed {
+    fn start(cam: Arc<Mutex<VirtualCam>>) -> Self {
+        let watcher = cam.lock().unwrap().watcher();
+        let (stop, rx) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("vcam-keepfed".into())
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(KEEP_FED_GAP) {
+                    if watcher.consumers() > 0 {
+                        cam.lock().unwrap().keep_fed(KEEP_FED_GAP);
+                    }
+                }
+            })
+            .ok();
+        Self { stop: Some(stop), thread }
+    }
+}
+
+impl Drop for KeepFed {
+    fn drop(&mut self) {
+        self.stop = None; // disconnects: the thread ends at once
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }

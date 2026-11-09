@@ -1049,13 +1049,16 @@ impl App {
         self.worker.set_preview_box(Some(((rect.width() * ppp) as usize, (rect.height() * ppp) as usize)));
 
         let state = self.worker.status();
-        let tex = self.preview_tex.as_ref().filter(|_| state == Status::Running);
+        let waiting = state == Status::Running && self.worker.waiting();
+        let tex = self.preview_tex.as_ref().filter(|_| state == Status::Running && !waiting);
         if let Some(t) = tex {
             let size = t.size_vec2() / ppp;
             egui::Image::from_texture(t).corner_radius(8).paint_at(ui, Rect::from_center_size(rect.center(), size));
         } else {
-            // Running but no frame yet still reads as starting.
-            self.paint_empty_preview(ui, rect, if state == Status::Running { Status::Starting } else { state });
+            // Running but no frame yet still reads as starting; paused reads
+            // as Running (see paint_empty_preview).
+            let shown = if state == Status::Running && !waiting { Status::Starting } else { state };
+            self.paint_empty_preview(ui, rect, shown);
         }
 
         // Status pill (top-left).
@@ -1064,6 +1067,11 @@ impl App {
         // the call can see it.
         let amber = DARK.warn;
         let pill = match state {
+            Status::Running if waiting => Some((
+                format!("●  STANDBY  ·  {}", self.worker.device().unwrap_or_default()),
+                p.preview_text,
+                Some("Your webcam is off and vcam uses no CPU until an app turns this camera on."),
+            )),
             Status::Running => {
                 let fps = self.worker.fps();
                 Some(match self.worker.device() {
@@ -1108,6 +1116,13 @@ impl App {
         let painter = ui.painter_at(rect);
         let (head, sub, button) = match state {
             Status::Starting => ("Starting your camera…", "The first start can take a few seconds.", None),
+            // Only shown while paused: no app has the virtual camera open.
+            Status::Running => (
+                "Waiting for your call",
+                "Your webcam turns on when Meet, Zoom or Teams uses OBS Virtual Camera, \
+                 and off again a few seconds after it stops.",
+                None,
+            ),
             Status::Error => ("Your camera stopped", "See the message below for what to do.", Some("Try again")),
             _ if self.cameras.is_empty() => (
                 "No webcam found",
@@ -1428,6 +1443,7 @@ impl App {
                 let sending = running && self.worker.device().is_some();
                 let (text, color) = match (&self.busy, self.vc.installed) {
                     (Some(b), _) => (b.clone(), p.muted),
+                    _ if sending && self.worker.waiting() => ("● On — waiting for Meet, Zoom or Teams".into(), p.success),
                     _ if sending => ("● Live in Meet, Zoom & Teams".into(), p.danger),
                     _ if running => ("● Preview only — calls can't see it yet".into(), p.warn),
                     (None, true) => ("● Ready for Meet, Zoom & Teams".into(), p.success),

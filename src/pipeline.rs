@@ -40,7 +40,8 @@ pub struct OutputPipeline {
 }
 
 impl OutputPipeline {
-    pub fn new(mut cam: Option<VirtualCam>, on_output: Option<OnOutput>) -> Result<Self> {
+    /// `cam` is shared: the session also feeds it while nothing is produced.
+    pub fn new(cam: Option<Arc<Mutex<VirtualCam>>>, on_output: Option<OnOutput>) -> Result<Self> {
         // Small queue => bounded latency + back-pressure on inference.
         let (tx, rx) = mpsc::sync_channel::<Job>(2);
         let latest = Arc::new(Mutex::new(None));
@@ -72,10 +73,10 @@ impl OutputPipeline {
                         // couldn't deliver the output's aspect ratio.
                         out = Arc::new(imgproc::resize_cover(&out, w, h));
                     }
-                    if let Some(cam) = cam.as_mut() {
+                    if let Some(cam) = &cam {
                         // No extra pacing: the webcam already paces us, and pacing
                         // twice turns into stalls when timers get coarse.
-                        cam.send(&out)?;
+                        cam.lock().unwrap().send(&out)?;
                     }
                     *l.lock().unwrap() = Some(out.clone());
                     if let Some(cb) = &on_output {
@@ -97,7 +98,7 @@ impl OutputPipeline {
                     *e.lock().unwrap() = Some(format!("{err:#}"));
                 }
             }
-            drop(cam); // close the virtual camera on this thread, after the last frame
+            drop(cam); // the virtual camera closes once the session lets go of it too
         })?;
         Ok(Self { tx: Some(tx), thread: Some(thread), latest, error })
     }

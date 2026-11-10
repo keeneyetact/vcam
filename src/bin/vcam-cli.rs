@@ -197,7 +197,7 @@ fn run(worker: &VCamWorker, show_preview: bool) -> i32 {
             Status::Stopped => return 0,
             _ => {}
         }
-        if worker.running() && last_report.elapsed() > Duration::from_secs(4) {
+        if worker.running() && !worker.waiting() && last_report.elapsed() > Duration::from_secs(4) {
             log!("~{:.1} fps", worker.fps());
             last_report = Instant::now();
         }

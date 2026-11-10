@@ -4,10 +4,15 @@
 //! reads frames from a named shared-memory queue, `OBSVirtualCamVideo`: a small
 //! header followed by three NV12 frame slots. This writes that queue directly,
 //! the way OBS itself (and pyvirtualcam) do, so OBS doesn't need to be running.
+//!
+//! The protocol is one-way (readers map it read-only), but each app streaming
+//! from the camera holds its own handle to the mapping, opened when its capture
+//! starts and closed when it lets the camera go. So the mapping's handle count
+//! says whether anyone is watching (`Watcher`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -60,6 +65,8 @@ pub struct VirtualCam {
     height: usize,
     epoch: Instant,
     nv12: Vec<u8>,
+    /// When a frame last went out.
+    last: Instant,
 }
 
 // The mapping is process-wide memory; nothing about it is tied to a thread.
@@ -107,8 +114,18 @@ impl VirtualCam {
                     reserved: [0; 8],
                 },
             );
-            Ok(Self { handle, view, width, height, epoch: Instant::now(), nv12: vec![0; frame_size] })
+            let now = Instant::now();
+            let mut cam = Self { handle, view, width, height, epoch: now, nv12: vec![0; frame_size], last: now };
+            // Ready at once, in black: an app reads the format from a *ready*
+            // queue when it opens the camera, so it negotiates our exact size.
+            cam.blank();
+            Ok(cam)
         }
+    }
+
+    /// Watches who has this camera open, without borrowing it.
+    pub fn watcher(&self) -> Watcher {
+        Watcher { handle: self.handle }
     }
 
     pub fn device(&self) -> &'static str {
@@ -125,6 +142,32 @@ impl VirtualCam {
             bail!("frame is {}x{}, virtual camera is {}x{}", frame.w, frame.h, self.width, self.height);
         }
         bgr_to_nv12(frame, &mut self.nv12);
+        self.publish();
+        Ok(())
+    }
+
+    /// Show black (BT.601 limited range; all-zero NV12 would be green).
+    pub fn blank(&mut self) {
+        let luma = self.width * self.height;
+        self.nv12[..luma].fill(16);
+        self.nv12[luma..].fill(128);
+        self.publish();
+    }
+
+    /// Publish the last frame again if nothing went out for `gap`. An app
+    /// that reads the same frame 10 times in a row drops the queue and reopens
+    /// it (an unwritten picture in between), so while nothing new is produced
+    /// this keeps it fed: a ~1.4 MB copy at 720p, no conversion. `gap` must be
+    /// under 10 of the app's frames (~330 ms at 30 fps).
+    pub fn keep_fed(&mut self, gap: Duration) {
+        if self.last.elapsed() >= gap {
+            self.publish();
+        }
+    }
+
+    /// Write `nv12` into the next slot and mark it readable.
+    fn publish(&mut self) {
+        self.last = Instant::now();
         let hdr = self.header();
         let inc = hdr.write_idx.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         let slot = (inc % 3) as usize;
@@ -137,7 +180,46 @@ impl VirtualCam {
         }
         hdr.read_idx.store(inc, Ordering::Release);
         hdr.state.store(STATE_READY, Ordering::Release);
-        Ok(())
+    }
+}
+
+/// How many apps are streaming from a `VirtualCam`. Only valid while that
+/// camera is open: the caller keeps it alive (it is `Copy`, holding no handle
+/// of its own, so it doesn't count itself).
+#[derive(Clone, Copy)]
+pub struct Watcher {
+    handle: HANDLE,
+}
+
+unsafe impl Send for Watcher {}
+
+#[repr(C)]
+#[derive(Default)]
+struct ObjectBasicInformation {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    /// winternl.h; class 0 is ObjectBasicInformation (PUBLIC_OBJECT_BASIC_INFORMATION).
+    fn NtQueryObject(handle: HANDLE, class: u32, info: *mut ObjectBasicInformation, len: u32, ret: *mut u32) -> i32;
+}
+
+impl Watcher {
+    /// Apps holding the camera open, i.e. the mapping's handles besides ours.
+    /// A syscall of a few microseconds.
+    pub fn consumers(&self) -> u32 {
+        let mut info = ObjectBasicInformation::default();
+        let len = std::mem::size_of::<ObjectBasicInformation>() as u32;
+        let status = unsafe { NtQueryObject(self.handle, 0, &mut info, len, std::ptr::null_mut()) };
+        if status < 0 {
+            return 0;
+        }
+        info.handle_count.saturating_sub(1)
     }
 }
 

@@ -519,6 +519,8 @@ struct GrabState {
     region: [f32; 4],
     seq: u64,
     running: bool,
+    /// Why the camera stopped, if it failed.
+    error: Option<String>,
 }
 
 /// Continuously pulls frames on a background thread so the main loop never
@@ -533,7 +535,8 @@ pub struct FrameGrabber {
 
 impl FrameGrabber {
     pub fn start(index: usize, width: usize, height: usize, fps: f64, exposure: ExposureMode) -> Result<(Self, CameraInfo)> {
-        let shared = Arc::new((Mutex::new(GrabState { frame: None, lift: 1.0, region: [0.0, 0.0, 1.0, 1.0], seq: 0, running: true }), Condvar::new()));
+        let state = GrabState { frame: None, lift: 1.0, region: [0.0, 0.0, 1.0, 1.0], seq: 0, running: true, error: None };
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (info_tx, info_rx) = mpsc::sync_channel::<Result<CameraInfo>>(1);
         let (done_tx, done) = mpsc::channel();
@@ -572,9 +575,11 @@ impl FrameGrabber {
                 }
                 Ok(())
             };
-            let _ = run();
+            let r = run();
             let (lock, cv) = &*sh;
-            lock.lock().unwrap().running = false;
+            let mut g = lock.lock().unwrap();
+            g.running = false;
+            g.error = r.err().map(|e| format!("{e:#}"));
             cv.notify_all();
         })?;
         let info = info_rx.recv().map_err(|_| anyhow!("camera thread failed"))??;
@@ -583,6 +588,11 @@ impl FrameGrabber {
 
     pub fn running(&self) -> bool {
         self.shared.0.lock().unwrap().running
+    }
+
+    /// Why the camera stopped delivering, once it has (e.g. another app took it).
+    pub fn error(&self) -> Option<String> {
+        self.shared.0.lock().unwrap().error.clone()
     }
 
     /// The part of the frame that's used (x0, y0, x1, y1 as fractions): the

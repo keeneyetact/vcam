@@ -80,6 +80,9 @@ pub struct Config {
     /// e.g. to make up for the light a fixed exposure gives up.
     pub brightness: f32,
     pub virtualcam: VirtualCamUse,
+    /// Keep the webcam running while started, instead of pausing it while no
+    /// app has the virtual camera open.
+    pub keep_webcam_on: bool,
 }
 
 impl Default for Config {
@@ -107,6 +110,7 @@ impl Default for Config {
             exposure: ExposureMode::Adaptive,
             brightness: 0.0,
             virtualcam: VirtualCamUse::Required,
+            keep_webcam_on: false,
         }
     }
 }
@@ -636,8 +640,12 @@ fn run_session(sh: &Arc<Shared>) -> Result<()> {
         }
         if let Some(watch) = watcher {
             // An app streaming from the virtual camera wants the output; so
-            // does the camera crop editor, which shows the live picture.
-            if watch.consumers() > 0 || sh.want_raw.load(Ordering::Relaxed) {
+            // does the camera crop editor, which shows the live picture, and
+            // the user who asked to keep the webcam on.
+            if watch.consumers() > 0
+                || sh.want_raw.load(Ordering::Relaxed)
+                || sh.cfg.lock().unwrap().keep_webcam_on
+            {
                 wanted_at = Instant::now();
             }
             if wanted_at.elapsed() >= LINGER {

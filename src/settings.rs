@@ -38,6 +38,8 @@ pub struct Settings {
     pub keep_frame_rate: bool,
     /// Picture brightness, -1 (darker) to 1 (brighter); 0 is as captured.
     pub brightness: f64,
+    /// Never pause the webcam while started, even with no app watching.
+    pub keep_webcam_on: bool,
     pub library_migrated: bool,
     pub advanced_open: bool,
     pub sidebar_open: bool,
@@ -74,6 +76,7 @@ impl Settings {
             // the exposure always.
             keep_frame_rate: b("dim_light_fps", false),
             brightness: m.get("brightness").and_then(Value::as_f64).unwrap_or(0.0),
+            keep_webcam_on: b("keep_webcam_on", false),
             library_migrated: b("library_migrated", false),
             advanced_open: b("advanced_open", true),
             sidebar_open: b("sidebar_open", true),
@@ -102,6 +105,7 @@ impl Settings {
             "one_person": self.one_person,
             "dim_light_fps": self.keep_frame_rate,
             "brightness": (self.brightness * 1000.0).round() / 1000.0,
+            "keep_webcam_on": self.keep_webcam_on,
             "library_migrated": self.library_migrated,
             "advanced_open": self.advanced_open,
             "sidebar_open": self.sidebar_open,

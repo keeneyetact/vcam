@@ -486,6 +486,8 @@ pub struct App {
     one_person: bool,
     keep_frame_rate: bool,
     brightness: f32,
+    /// Don't pause the webcam while no app uses the virtual camera.
+    keep_webcam_on: bool,
     adv_open: bool,
     side_open: bool,
 
@@ -597,6 +599,7 @@ impl App {
             one_person: s.one_person,
             keep_frame_rate: s.keep_frame_rate,
             brightness: (s.brightness as f32).clamp(-1.0, 1.0),
+            keep_webcam_on: s.keep_webcam_on,
             adv_open: s.advanced_open,
             side_open: s.sidebar_open,
             vc: virtualcam::status(),
@@ -663,6 +666,7 @@ impl App {
             one_person: self.one_person,
             keep_frame_rate: self.keep_frame_rate,
             brightness: self.brightness as f64,
+            keep_webcam_on: self.keep_webcam_on,
             library_migrated: true,
             advanced_open: self.adv_open,
             sidebar_open: self.side_open,
@@ -894,6 +898,7 @@ impl App {
             c.multi_person = !self.one_person;
             c.exposure = exposure_mode(self.keep_frame_rate);
             c.brightness = self.brightness;
+            c.keep_webcam_on = self.keep_webcam_on;
             c.downsample = QUALITY_PRESETS[self.quality].1;
             (c.width, c.height, c.out_width, c.out_height) = (cw, ch, ow, oh);
         });
@@ -2223,6 +2228,17 @@ impl App {
         {
             // Reopens the camera with the new setting.
             self.worker.configure(|c| c.exposure = exposure_mode(self.keep_frame_rate));
+            self.schedule_save();
+        }
+        if Self::switch(ui, p, &mut self.keep_webcam_on, "Keep webcam on")
+            .on_hover_text(
+                "Keeps your webcam running after Start camera, even when no app is using \
+                 OBS Virtual Camera. Turn off to let vcam pause the webcam and save CPU until a call starts.",
+            )
+            .changed()
+        {
+            // Live: the next loop sees it, no reconnect.
+            self.worker.configure(|c| c.keep_webcam_on = self.keep_webcam_on);
             self.schedule_save();
         }
 
